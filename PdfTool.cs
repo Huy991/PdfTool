@@ -1,6 +1,7 @@
 // PdfTool - bộ công cụ PDF (gộp, tách, nén, xoay, chuyển đổi, OCR, đánh số trang, đóng dấu, mật khẩu)
 // Dùng các công cụ dòng lệnh mã nguồn mở: qpdf, Ghostscript, Tesseract (tìm trong thư mục tools\ cạnh exe,
 // hoặc trong thư mục cài đặt PDF24, hoặc trong PATH).
+// Chuyển đổi Word, Excel, PowerPoint dùng Microsoft Office có sẵn trên máy (điều khiển qua COM).
 // Biên dịch: chạy build.bat (dùng csc.exe có sẵn của .NET Framework 4.x)
 
 using System;
@@ -15,11 +16,13 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Net;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 namespace PdfTool
 {
@@ -99,12 +102,37 @@ namespace PdfTool
         }
 
         // Tiến trình đang chạy theo từng luồng, để "Dừng" chỉ hủy đúng công việc của luồng đó
-        static readonly Dictionary<Thread, Process> running = new Dictionary<Thread, Process>();
+        static readonly Dictionary<Thread, List<Process>> running = new Dictionary<Thread, List<Process>>();
+
+        public static void Track(Process p)
+        {
+            lock (running)
+            {
+                List<Process> list;
+                if (!running.TryGetValue(Thread.CurrentThread, out list)) running[Thread.CurrentThread] = list = new List<Process>();
+                list.Add(p);
+            }
+        }
+
+        public static void Untrack(Process p)
+        {
+            lock (running)
+            {
+                List<Process> list;
+                if (running.TryGetValue(Thread.CurrentThread, out list) && list.Remove(p) && list.Count == 0) running.Remove(Thread.CurrentThread);
+            }
+        }
+
         public static void Kill(Thread t)
         {
-            Process p;
-            lock (running) running.TryGetValue(t, out p);
-            try { if (p != null && !p.HasExited) p.Kill(); } catch { }
+            List<Process> list;
+            lock (running)
+            {
+                if (!running.TryGetValue(t, out list)) return;
+                list = new List<Process>(list);
+            }
+            foreach (Process p in list)
+                try { if (!p.HasExited) p.Kill(); } catch { }
         }
 
         public static int Run(string exe, string args, out string output)
@@ -126,11 +154,11 @@ namespace PdfTool
                 p.OutputDataReceived += h;
                 p.ErrorDataReceived += h;
                 p.Start();
-                lock (running) running[Thread.CurrentThread] = p;
+                Track(p);
                 p.BeginOutputReadLine();
                 p.BeginErrorReadLine();
                 p.WaitForExit();
-                lock (running) running.Remove(Thread.CurrentThread);
+                Untrack(p);
                 lock (sb) output = sb.ToString();
                 return p.ExitCode;
             }
@@ -934,93 +962,476 @@ namespace PdfTool
                 job.Done(outPath);
             });
         }
+
+        // ---------------- Microsoft Office ----------------
+        // Office chạy ẩn nên không ai trả lời được hộp thoại hỏi mật khẩu: đưa mật khẩu sai để file có mật khẩu báo lỗi ngay
+        const string WrongPassword = "PdfTool-khong-co-mat-khau";
+
+        // File Office kiểu mới (docx, xlsx, pptx...) là file zip; khi đặt mật khẩu mở, Office lưu thành file OLE mã hóa.
+        // PowerPoint không nhận mật khẩu qua COM nên phải phát hiện trước khi mở.
+        static void EnsureNoPassword(string f, string app)
+        {
+            if (Path.GetExtension(f).Length != 5) return; // .docx, .xlsm, .pptx... (đuôi kiểu cũ .doc, .xls, .ppt chỉ có 3 chữ)
+            var head = new byte[4];
+            using (var s = File.OpenRead(f)) s.Read(head, 0, 4);
+            if (head[0] == 0xD0 && head[1] == 0xCF && head[2] == 0x11 && head[3] == 0xE0)
+                throw new InvalidOperationException("File được đặt mật khẩu mở. Hãy mở bằng " + app + ", gỡ mật khẩu rồi thử lại.");
+        }
+
+        public static void WordToPdf(Job job, bool forScreen, bool bookmarks)
+        {
+            using (var word = OfficeApp.Word(job))
+            {
+                object docs = word.Get(word.App, "Documents");
+                job.Each(f =>
+                {
+                    EnsureNoPassword(f, "Word");
+                    string outPath = job.Out(f, "", ".pdf");
+                    object doc = word.Call(docs, "Open", "FileName", f, "ConfirmConversions", false, "ReadOnly", true, "AddToRecentFiles", false,
+                                           "PasswordDocument", WrongPassword, "Visible", false, "NoEncodingDialog", true);
+                    try
+                    {
+                        word.Call(doc, "ExportAsFixedFormat", "OutputFileName", outPath, "ExportFormat", 17 /* wdExportFormatPDF */, "OpenAfterExport", false,
+                                  "OptimizeFor", forScreen ? 1 : 0, "IncludeDocProps", true, "CreateBookmarks", bookmarks ? 1 : 0 /* dấu trang theo đề mục */,
+                                  "DocStructureTags", true);
+                    }
+                    finally { word.Close(doc, "SaveChanges", 0); }
+                    job.Done(outPath);
+                });
+            }
+        }
+
+        public static void ExcelToPdf(Job job, bool activeSheetOnly, bool fitWidth)
+        {
+            using (var excel = OfficeApp.Excel(job))
+            {
+                object books = excel.Get(excel.App, "Workbooks");
+                job.Each(f =>
+                {
+                    EnsureNoPassword(f, "Excel");
+                    string outPath = job.Out(f, "", ".pdf");
+                    object wb = excel.Call(books, "Open", "Filename", f, "UpdateLinks", 0, "ReadOnly", true, "Password", WrongPassword,
+                                           "IgnoreReadOnlyRecommended", true, "Notify", false, "AddToMru", false);
+                    try
+                    {
+                        if (fitWidth) FitToPageWidth(job, excel, wb, activeSheetOnly);
+                        excel.Call(activeSheetOnly ? excel.Get(wb, "ActiveSheet") : wb, "ExportAsFixedFormat", "Type", 0 /* xlTypePDF */, "Filename", outPath,
+                                   "Quality", 0, "IncludeDocProperties", true, "IgnorePrintAreas", false, "OpenAfterPublish", false);
+                    }
+                    finally { excel.Close(wb, "SaveChanges", false); }
+                    job.Done(outPath);
+                });
+            }
+        }
+
+        // Co mỗi trang tính vừa một trang giấy theo chiều ngang (chiều dọc bao nhiêu trang tùy nội dung). Chỉ đổi bản đang mở, không lưu vào file.
+        static void FitToPageWidth(Job job, OfficeApp excel, object wb, bool activeSheetOnly)
+        {
+            try
+            {
+                var sheets = new List<object>();
+                if (activeSheetOnly) sheets.Add(excel.Get(wb, "ActiveSheet"));
+                else
+                {
+                    object all = excel.Get(wb, "Worksheets");
+                    int n = (int)excel.Get(all, "Count");
+                    for (int i = 1; i <= n; i++) sheets.Add(excel.Get(all, "Item", i));
+                }
+                excel.Set(excel.App, "PrintCommunication", false); // gom các thay đổi trang in, nhanh hơn nhiều khi có nhiều trang tính
+                try
+                {
+                    foreach (object sh in sheets)
+                    {
+                        object ps = excel.Get(sh, "PageSetup");
+                        excel.Set(ps, "Zoom", false);
+                        excel.Set(ps, "FitToPagesWide", 1);
+                        excel.Set(ps, "FitToPagesTall", false);
+                    }
+                }
+                finally { excel.Set(excel.App, "PrintCommunication", true); }
+            }
+            catch (Exception ex)
+            {
+                if (job.Cancelled) throw;
+                job.Log("   Không co được trang tính (" + ex.Message + "). Giữ nguyên thiết lập trang in của file.");
+            }
+        }
+
+        public static void PowerPointToPdf(Job job)
+        {
+            using (var ppt = OfficeApp.PowerPoint(job))
+            {
+                object list = ppt.Get(ppt.App, "Presentations");
+                job.Each(f =>
+                {
+                    EnsureNoPassword(f, "PowerPoint");
+                    string outPath = job.Out(f, "", ".pdf");
+                    object pres = ppt.Call(list, "Open", "FileName", f, "ReadOnly", -1 /* msoTrue */, "WithWindow", 0 /* msoFalse: không hiện cửa sổ */);
+                    try { ppt.Call(pres, "SaveAs", "FileName", outPath, "FileFormat", 32 /* ppSaveAsPDF */); }
+                    finally { ppt.Close(pres); }
+                    job.Done(outPath);
+                });
+            }
+        }
+
+        public static void PdfToWord(Job job)
+        {
+            // Mỗi lần mở PDF, Word hỏi "Word sẽ chuyển PDF thành tài liệu có thể chỉnh sửa..." và chờ bấm OK; Word chạy ẩn nên sẽ treo.
+            // Tạm bật tùy chọn "không hiện lại thông báo này" của Word (đặt trước khi mở Word), xong việc trả lại như cũ.
+            using (new TempRegValue(OfficeApp.RegKey("Word") + @"\Options", "DisableConvertPdfWarning", 1))
+            using (var word = OfficeApp.Word(job))
+            {
+                if (word.Version < 15) throw new InvalidOperationException("Cần Microsoft Word 2013 trở lên để chuyển PDF sang Word.");
+                object docs = word.Get(word.App, "Documents");
+                job.Each(f =>
+                {
+                    Ext.EnsureOpenable(f);
+                    string outPath = job.Out(f, "", ".docx");
+                    job.Log("   Word đang đọc PDF, file nhiều trang có thể mất vài phút...");
+                    object doc = word.Call(docs, "Open", "FileName", f, "ConfirmConversions", false, "ReadOnly", true, "AddToRecentFiles", false, "Visible", false);
+                    try { word.Call(doc, "SaveAs2", "FileName", outPath, "FileFormat", 16 /* wdFormatDocumentDefault: .docx */, "AddToRecentFiles", false); }
+                    finally { word.Close(doc, "SaveChanges", 0); }
+                    job.Done(outPath);
+                });
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Một phiên Microsoft Office (Word, Excel, PowerPoint) chạy ẩn, điều khiển qua COM.
+    // Gọi theo tên (late binding) nên không cần thư viện Interop và dùng được với mọi phiên bản Office.
+    // ------------------------------------------------------------------
+    public class OfficeApp : IDisposable
+    {
+        public readonly object App;
+        readonly Job job;
+        readonly string name;
+        readonly Process proc;                   // Office do PdfTool mở; null = dùng chung PowerPoint người dùng đang mở sẵn
+        readonly List<object> refs = new List<object>();
+        readonly List<KeyValuePair<string, object>> changed = new List<KeyValuePair<string, object>>();
+
+        const int RPC_E_CALL_REJECTED = unchecked((int)0x80010001), RPC_E_SERVERCALL_RETRYLATER = unchecked((int)0x8001010A);
+
+        public static OfficeApp Word(Job job) { return Start(job, "Word", "WINWORD", "DisplayAlerts", 0 /* wdAlertsNone */, "AutomationSecurity", 3 /* không chạy macro */); }
+        public static OfficeApp Excel(Job job) { return Start(job, "Excel", "EXCEL", "DisplayAlerts", false, "AutomationSecurity", 3); }
+        public static OfficeApp PowerPoint(Job job) { return Start(job, "PowerPoint", "POWERPNT", "DisplayAlerts", 1 /* ppAlertsNone */, "AutomationSecurity", 3); }
+
+        // Mở Office rồi đặt các tùy chọn (cặp tên, giá trị) để không hiện hộp thoại nào
+        static OfficeApp Start(Job job, string name, string exe, params object[] options)
+        {
+            var o = new OfficeApp(job, name, exe);
+            try
+            {
+                for (int i = 0; i + 1 < options.Length; i += 2)
+                {
+                    string prop = (string)options[i];
+                    o.changed.Add(new KeyValuePair<string, object>(prop, o.Get(o.App, prop)));
+                    o.Set(o.App, prop, options[i + 1]);
+                }
+                return o;
+            }
+            catch { o.Dispose(); throw; }
+        }
+
+        OfficeApp(Job job, string name, string exe)
+        {
+            this.job = job;
+            this.name = name;
+            Type type = Type.GetTypeFromProgID(name + ".Application");
+            if (type == null) throw new InvalidOperationException("Máy chưa cài Microsoft " + name + ". Công cụ này dùng " + name + " có sẵn trên máy để chuyển đổi.");
+            ForgetCrashes(name, job.Inputs);
+            job.Log("Đang khởi động Microsoft " + name + "...");
+            int[] before = Pids(exe);
+            try { App = Activator.CreateInstance(type); }
+            catch (Exception ex) { throw new InvalidOperationException("Không khởi động được Microsoft " + name + ": " + ex.Message); }
+            refs.Add(App);
+            // Tiến trình vừa mở thêm: "Dừng" sẽ tắt nó. PowerPoint chỉ chạy một bản nên nếu đang mở sẵn thì dùng chung, không tắt.
+            int pid = Pids(exe).Except(before).FirstOrDefault();
+            if (pid != 0) try { proc = Process.GetProcessById(pid); } catch { }
+            if (proc != null) Ext.Track(proc);
+        }
+
+        static int[] Pids(string exe)
+        {
+            Process[] ps = Process.GetProcessesByName(exe);
+            int[] ids = ps.Select(p => p.Id).ToArray();
+            foreach (Process p in ps) p.Dispose();
+            return ids;
+        }
+
+        // Khóa cài đặt của ứng dụng trong HKEY_CURRENT_USER, ví dụ Software\Microsoft\Office\16.0\Word (đọc được khi chưa mở Office)
+        public static string RegKey(string name)
+        {
+            string ver = null;
+            using (RegistryKey k = Registry.ClassesRoot.OpenSubKey(name + @".Application\CurVer"))
+                if (k != null) ver = k.GetValue("") as string;                        // "Word.Application.16"
+            int dot = ver == null ? -1 : ver.LastIndexOf('.');
+            return @"Software\Microsoft\Office\" + (dot > 0 ? ver.Substring(dot + 1) + ".0" : "16.0") + @"\" + name;
+        }
+
+        // Office bị tắt ngang khi đang mở một file (ví dụ bấm "Dừng") sẽ ghi nhớ file đó; lần sau mở lại thì hỏi "Lần trước mở file này
+        // gây lỗi nghiêm trọng, vẫn muốn mở?" và vì chạy ẩn nên sẽ treo. Xóa ghi nhớ của đúng các file sắp chuyển đổi.
+        static void ForgetCrashes(string name, List<string> files)
+        {
+            foreach (string sub in new[] { "DisabledItems", "StartupItems" })
+                try
+                {
+                    using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RegKey(name) + @"\Resiliency\" + sub, true))
+                    {
+                        if (k == null) continue;
+                        foreach (string v in k.GetValueNames())
+                        {
+                            var data = k.GetValue(v) as byte[];
+                            if (data == null || data.Length < 2) continue;
+                            // Đường dẫn lưu dạng UTF-16 trong dữ liệu nhị phân; đọc cả hai cách căn byte
+                            string text = Encoding.Unicode.GetString(data) + "\n" + Encoding.Unicode.GetString(data, 1, data.Length - 1);
+                            if (files.Any(f => text.IndexOf(f, StringComparison.OrdinalIgnoreCase) >= 0)) k.DeleteValue(v, false);
+                        }
+                    }
+                }
+                catch { }
+        }
+
+        public double Version
+        {
+            get
+            {
+                double v;
+                return double.TryParse(Get(App, "Version") as string, NumberStyles.Float, CultureInfo.InvariantCulture, out v) ? v : 0;
+            }
+        }
+
+        public object Get(object target, string prop, params object[] index) { return Invoke(target, prop, BindingFlags.GetProperty, index, null); }
+
+        public void Set(object target, string prop, object value) { Invoke(target, prop, BindingFlags.SetProperty, new[] { value }, null); }
+
+        // Gọi phương thức với tham số theo tên: Call(doc, "Close", "SaveChanges", 0)
+        public object Call(object target, string method, params object[] namedArgs)
+        {
+            int n = namedArgs.Length / 2;
+            var names = new string[n];
+            var values = new object[n];
+            for (int i = 0; i < n; i++) { names[i] = (string)namedArgs[2 * i]; values[i] = namedArgs[2 * i + 1]; }
+            return Invoke(target, method, BindingFlags.InvokeMethod, values, n > 0 ? names : null);
+        }
+
+        // Đóng tài liệu, bỏ qua lỗi (Office có thể đã bị dừng); tài liệu còn sót sẽ đóng theo khi thoát Office
+        public void Close(object doc, params object[] namedArgs)
+        {
+            try { Call(doc, "Close", namedArgs); } catch { }
+        }
+
+        object Invoke(object target, string member, BindingFlags kind, object[] args, string[] names)
+        {
+            DateTime giveUp = DateTime.Now.AddSeconds(60);
+            while (true)
+            {
+                try
+                {
+                    object r = target.GetType().InvokeMember(member, kind, null, target, args, null, null, names);
+                    if (r != null && Marshal.IsComObject(r)) refs.Add(r);
+                    return r;
+                }
+                catch (Exception ex)
+                {
+                    if (job.Cancelled) throw new OperationCanceledException();
+                    Exception inner = ex is TargetInvocationException && ex.InnerException != null ? ex.InnerException : ex;
+                    var com = inner as COMException;
+                    int code = com != null ? com.ErrorCode : 0;
+                    // Office đang bận (vừa khởi động, đang mở file...) thì từ chối lời gọi: chờ rồi gọi lại
+                    if (code == RPC_E_CALL_REJECTED || code == RPC_E_SERVERCALL_RETRYLATER)
+                    {
+                        if (DateTime.Now < giveUp) { Thread.Sleep(250); continue; }
+                        throw new InvalidOperationException("Microsoft " + name + " không phản hồi (có thể đang chờ trả lời một hộp thoại).");
+                    }
+                    if (code == unchecked((int)0x800706BA) || code == unchecked((int)0x800706BE) || code == unchecked((int)0x80010108))
+                        throw new InvalidOperationException("Microsoft " + name + " đã thoát đột ngột.");
+                    throw new InvalidOperationException(name + " báo lỗi: " + inner.Message.Trim(), inner);
+                }
+            }
+        }
+
+        // Thoát Office nếu do PdfTool mở và không ai đang dùng. Nếu người dùng mở file vào đúng phiên này
+        // (cửa sổ đã hiện lên) hoặc đây là PowerPoint đang mở sẵn: để lại, chỉ trả lại các tùy chọn đã đổi.
+        public void Dispose()
+        {
+            bool quit = proc != null && !IsVisible();
+            try
+            {
+                if (quit) Call(App, "Quit");
+                else for (int i = changed.Count - 1; i >= 0; i--) Set(App, changed[i].Key, changed[i].Value);
+            }
+            catch { }
+            for (int i = refs.Count - 1; i >= 0; i--) try { Marshal.FinalReleaseComObject(refs[i]); } catch { }
+            refs.Clear();
+            if (proc == null) return;
+            if (quit) try { if (!proc.WaitForExit(10000)) proc.Kill(); } catch { }
+            Ext.Untrack(proc);
+            proc.Dispose();
+        }
+
+        bool IsVisible()
+        {
+            try { return Convert.ToInt32(Get(App, "Visible")) != 0; }
+            catch { return false; }
+        }
+    }
+
+    // Đặt tạm một giá trị DWORD trong HKEY_CURRENT_USER; Dispose() trả lại giá trị cũ (hoặc xóa nếu trước đó chưa có)
+    class TempRegValue : IDisposable
+    {
+        readonly string key, name;
+        readonly object old;
+        readonly RegistryValueKind oldKind;
+
+        public TempRegValue(string key, string name, int value)
+        {
+            this.key = key;
+            this.name = name;
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(key))
+                {
+                    old = k.GetValue(name);
+                    if (old != null) oldKind = k.GetValueKind(name);
+                    k.SetValue(name, value, RegistryValueKind.DWord);
+                }
+            }
+            catch { }
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.CreateSubKey(key))
+                    if (old == null) k.DeleteValue(name, false);
+                    else k.SetValue(name, old, oldKind);
+            }
+            catch { }
+        }
     }
 
     // ------------------------------------------------------------------
     // Định nghĩa công cụ và giao diện tùy chọn
     // ------------------------------------------------------------------
+    // Bảng tùy chọn: cột nhãn bên trái, ô nhập giãn hết cột bên phải, gợi ý chữ nhỏ bên dưới ô
     class Opts : TableLayoutPanel
     {
-        readonly float scale;
-        int S(int v) { return (int)(v * scale); }
+        readonly List<Label> wrapping = new List<Label>();
+
+        static int S(int v) { return Theme.S(v); }
 
         public Opts(float scale)
         {
-            this.scale = scale;
-            ColumnCount = 3;
+            ColumnCount = 2;
             AutoSize = true;
             AutoSizeMode = AutoSizeMode.GrowAndShrink;
             Dock = DockStyle.Top;
             ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
-            ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            Resize += (s, e) => { foreach (var l in wrapping) l.MaximumSize = new Size(Math.Max(S(100), ClientSize.Width - S(10)), 0); };
         }
 
-        T Row<T>(string label, T c, string hint) where T : Control
+        T Row<T>(string label, T c, Control layout, bool stretch, string hint) where T : Control
         {
             int r = RowCount++;
             RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            Controls.Add(new Label { Text = label, AutoSize = true, Margin = new Padding(S(3), S(7), S(10), S(3)) }, 0, r);
-            c.Margin = new Padding(S(3));
-            Controls.Add(c, 1, r);
-            if (hint != null) Controls.Add(new Label { Text = hint, AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(S(6), S(7), S(3), S(3)) }, 2, r);
+            Controls.Add(new Label { Text = label, AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, S(4), S(16), S(4)) }, 0, r);
+            layout.Margin = new Padding(0, S(4), 0, S(4));
+            layout.Anchor = stretch ? AnchorStyles.Left | AnchorStyles.Right : AnchorStyles.Left;
+            Controls.Add(layout, 1, r);
+            if (hint != null)
+            {
+                r = RowCount++;
+                RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                var h = new Label { Text = hint, AutoSize = true, Font = Theme.Ui(9f), Margin = new Padding(S(2), 0, 0, S(6)) };
+                Theme.Fg(h, TextRole.Muted);
+                Controls.Add(h, 1, r);
+            }
             return c;
         }
 
-        public ComboBox Combo(string label, int width, params string[] items)
+        public FSelect Combo(string label, int width, params string[] items)
         {
-            var c = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = S(width) };
+            var c = new FSelect();
             c.Items.AddRange(items);
             c.SelectedIndex = 0;
-            return Row(label, c, null);
+            return Row(label, c, c, true, null);
         }
 
         public TextBox Input(string label, int width, string value, string hint, bool password = false)
         {
-            return Row(label, new TextBox { Width = S(width), Text = value, UseSystemPasswordChar = password }, hint);
+            var t = new TextBox { Text = value, UseSystemPasswordChar = password };
+            return Row(label, t, new FieldHost(t), true, hint);
         }
 
-        public NumericUpDown Num(string label, int min, int max, int value, string hint)
+        public NumBox Num(string label, int min, int max, int value, string hint)
         {
-            return Row(label, new NumericUpDown { Minimum = min, Maximum = max, Value = value, Width = S(80) }, hint);
+            var n = new NumBox { Minimum = min, Maximum = max, Value = value };
+            return Row(label, n, n, false, hint);
         }
 
         public CheckBox Check(string text, bool value)
         {
             int r = RowCount++;
             RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            var c = new CheckBox { Text = text, Checked = value, AutoSize = true, Margin = new Padding(S(3), S(5), S(3), S(3)) };
+            var c = new FCheck(text, value) { Margin = new Padding(0, S(4), 0, S(4)) };
             Controls.Add(c, 1, r);
-            SetColumnSpan(c, 2);
             return c;
         }
 
-        public Button ColorPick(string label, Color value)
+        public ColorSwatch ColorPick(string label, Color value)
         {
-            var b = new Button { Width = S(80), Height = S(26), BackColor = value, FlatStyle = FlatStyle.Flat };
-            b.Click += (s, e) =>
-            {
-                using (var d = new ColorDialog { Color = b.BackColor, FullOpen = true })
-                    if (d.ShowDialog(FindForm()) == DialogResult.OK) b.BackColor = d.Color;
-            };
-            return Row(label, b, null);
+            var b = new ColorSwatch(value);
+            return Row(label, b, b, false, null);
         }
 
         public void Note(string text)
         {
             int r = RowCount++;
             RowStyles.Add(new RowStyle(SizeType.AutoSize));
-            var l = new Label { Text = text, AutoSize = true, ForeColor = Color.DimGray, MaximumSize = new Size(S(620), 0), Margin = new Padding(S(3), S(6), S(3), S(3)) };
+            var l = new Label { Text = text, AutoSize = true, Font = Theme.Ui(9f), MaximumSize = new Size(S(560), 0), Margin = new Padding(0, S(8), 0, S(4)) };
+            Theme.Fg(l, TextRole.Muted);
+            wrapping.Add(l);
             Controls.Add(l, 0, r);
-            SetColumnSpan(l, 3);
+            SetColumnSpan(l, 2);
         }
+    }
+
+    // Loại file đầu vào của công cụ
+    class FileKind
+    {
+        public readonly string Name, Title, Glyph;   // tên dùng trong câu ("file Word"), tiêu đề danh sách file, biểu tượng ô kéo thả
+        public readonly string[] Extensions;
+
+        public FileKind(string name, string title, string glyph, params string[] extensions)
+        {
+            Name = name; Title = title; Glyph = glyph; Extensions = extensions;
+        }
+
+        // Bộ lọc của hộp thoại chọn file
+        public string Filter
+        {
+            get
+            {
+                string p = string.Join(";", Extensions.Select(e => "*" + e));
+                return char.ToUpperInvariant(Name[0]) + Name.Substring(1) + " (" + p + ")|" + p + "|Tất cả file|*.*";
+            }
+        }
+
+        public static readonly FileKind Pdf = new FileKind("file PDF", "File PDF cần xử lý", "\uE896", ".pdf");
+        public static readonly FileKind Image = new FileKind("ảnh", "Ảnh cần chuyển", "\uEB9F", ImageUtil.Extensions);
+        public static readonly FileKind Word = new FileKind("file Word", "File Word cần chuyển", "\uE896", ".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm", ".rtf", ".odt");
+        public static readonly FileKind Excel = new FileKind("file Excel", "File Excel cần chuyển", "\uE896", ".xls", ".xlsx", ".xlsm", ".xlsb", ".csv", ".ods");
+        public static readonly FileKind PowerPoint = new FileKind("file PowerPoint", "File PowerPoint cần chuyển", "\uE896", ".ppt", ".pptx", ".pptm", ".pps", ".ppsx", ".pot", ".potx", ".odp");
     }
 
     class ToolDef
     {
-        public string Name, Short, Desc;
+        public string Name, Glyph, Group, Desc;
         public Color Color;
-        public bool ImageInput;              // đầu vào là ảnh (ngược lại: PDF)
+        public FileKind Input = FileKind.Pdf;
         public int MinFiles = 1;
         public Opts Options;
         public Func<Action<Job>> Prepare;    // gọi trên luồng giao diện: đọc tùy chọn, trả về công việc chạy nền (null = hủy)
@@ -1048,7 +1459,7 @@ namespace PdfTool
 
             // --- Gộp PDF
             {
-                var t = new ToolDef { Name = "Gộp PDF", Short = "GỘP", Color = Color.FromArgb(0, 120, 212), MinFiles = 2,
+                var t = new ToolDef { Name = "Gộp PDF", Glyph = "\uEA3C", Group = "Trang", Color = Color.FromArgb(37, 99, 235), MinFiles = 2,
                     Desc = "Nối nhiều file PDF thành một file theo thứ tự trong danh sách (dùng nút Lên/Xuống để sắp xếp)." };
                 var o = t.Options = new Opts(scale);
                 var name = o.Input("Tên file kết quả", 260, "Gop_PDF", ".pdf");
@@ -1064,7 +1475,7 @@ namespace PdfTool
 
             // --- Tách PDF
             {
-                var t = new ToolDef { Name = "Tách PDF", Short = "TÁCH", Color = Color.FromArgb(16, 137, 62),
+                var t = new ToolDef { Name = "Tách PDF", Glyph = "\uE8C6", Group = "Trang", Color = Color.FromArgb(22, 163, 74),
                     Desc = "Tách một file PDF thành nhiều file: mỗi trang một file, mỗi N trang một file, hoặc theo các khoảng trang." };
                 var o = t.Options = new Opts(scale);
                 var mode = o.Combo("Cách tách", 260, "Mỗi trang thành 1 file", "Mỗi N trang thành 1 file", "Theo khoảng trang (mỗi khoảng 1 file)");
@@ -1088,7 +1499,7 @@ namespace PdfTool
 
             // --- Trích xuất / sắp xếp trang
             {
-                var t = new ToolDef { Name = "Trích xuất / sắp xếp trang", Short = "TRÍCH", Color = Color.FromArgb(0, 153, 188),
+                var t = new ToolDef { Name = "Trích xuất / sắp xếp trang", Glyph = "\uE8CB", Group = "Trang", Color = Color.FromArgb(8, 145, 178),
                     Desc = "Tạo file mới chỉ gồm các trang được chọn, theo đúng thứ tự nhập. Dùng để lấy vài trang, sắp xếp lại hoặc đảo ngược thứ tự (z-1)." };
                 var o = t.Options = new Opts(scale);
                 var pages = o.Input("Trang cần lấy", 260, "1-3", rangeHint);
@@ -1104,7 +1515,7 @@ namespace PdfTool
 
             // --- Xóa trang
             {
-                var t = new ToolDef { Name = "Xóa trang", Short = "XÓA", Color = Color.FromArgb(209, 52, 56),
+                var t = new ToolDef { Name = "Xóa trang", Glyph = "\uE74D", Group = "Trang", Color = Color.FromArgb(220, 38, 38),
                     Desc = "Xóa các trang không cần thiết khỏi file PDF." };
                 var o = t.Options = new Opts(scale);
                 var pages = o.Input("Trang cần xóa", 260, "1", rangeHint);
@@ -1119,7 +1530,7 @@ namespace PdfTool
 
             // --- Xoay trang
             {
-                var t = new ToolDef { Name = "Xoay trang", Short = "XOAY", Color = Color.FromArgb(135, 100, 184),
+                var t = new ToolDef { Name = "Xoay trang", Glyph = "\uE7AD", Group = "Trang", Color = Color.FromArgb(124, 58, 237),
                     Desc = "Xoay tất cả hoặc một số trang của file PDF." };
                 var o = t.Options = new Opts(scale);
                 var angle = o.Combo("Góc xoay", 200, "90° theo chiều kim đồng hồ", "180°", "90° ngược chiều kim đồng hồ");
@@ -1136,7 +1547,7 @@ namespace PdfTool
 
             // --- Nén PDF
             {
-                var t = new ToolDef { Name = "Nén PDF", Short = "NÉN", Color = Color.FromArgb(202, 80, 16),
+                var t = new ToolDef { Name = "Nén PDF", Glyph = "\uF012", Group = "Tối ưu & chuyển đổi", Color = Color.FromArgb(234, 88, 12),
                     Desc = "Giảm dung lượng file PDF bằng cách giảm độ phân giải ảnh và tối ưu phông chữ." };
                 var o = t.Options = new Opts(scale);
                 var level = o.Combo("Mức nén", 300, "Khuyến nghị - 150 dpi (cân bằng)", "Nén mạnh - 96 dpi (file nhỏ nhất)", "Nén nhẹ - 200 dpi (giữ chất lượng in)", "Chất lượng cao - 300 dpi");
@@ -1153,7 +1564,7 @@ namespace PdfTool
 
             // --- Ảnh sang PDF
             {
-                var t = new ToolDef { Name = "Ảnh sang PDF", Short = "ẢNH→", Color = Color.FromArgb(227, 0, 140), ImageInput = true,
+                var t = new ToolDef { Name = "Ảnh sang PDF", Glyph = "\uEB9F", Group = "Tối ưu & chuyển đổi", Color = Color.FromArgb(219, 39, 119), Input = FileKind.Image,
                     Desc = "Chuyển ảnh JPG, PNG, BMP, GIF, TIFF thành PDF. Ảnh JPG được nhúng nguyên gốc, không giảm chất lượng." };
                 var o = t.Options = new Opts(scale);
                 var size = o.Combo("Khổ trang", 220, "A4", "Theo kích thước ảnh", "A3", "A5", "Letter");
@@ -1175,7 +1586,7 @@ namespace PdfTool
 
             // --- PDF sang ảnh
             {
-                var t = new ToolDef { Name = "PDF sang ảnh", Short = "→ẢNH", Color = Color.FromArgb(0, 99, 177),
+                var t = new ToolDef { Name = "PDF sang ảnh", Glyph = "\uE8B9", Group = "Tối ưu & chuyển đổi", Color = Color.FromArgb(2, 132, 199),
                     Desc = "Xuất mỗi trang PDF thành một file ảnh PNG hoặc JPG." };
                 var o = t.Options = new Opts(scale);
                 var fmt = o.Combo("Định dạng", 200, "PNG (sắc nét)", "JPG (file nhỏ)");
@@ -1193,7 +1604,7 @@ namespace PdfTool
 
             // --- OCR
             {
-                var t = new ToolDef { Name = "Nhận dạng chữ (OCR)", Short = "OCR", Color = Color.FromArgb(0, 128, 128),
+                var t = new ToolDef { Name = "Nhận dạng chữ (OCR)", Glyph = "\uE8AC", Group = "Tối ưu & chuyển đổi", Color = Color.FromArgb(13, 148, 136),
                     Desc = "Nhận dạng chữ trong PDF scan để có thể tìm kiếm và sao chép văn bản. Giữ nguyên hình ảnh gốc, chỉ thêm lớp chữ ẩn." };
                 var o = t.Options = new Opts(scale);
                 var lang = o.Combo("Ngôn ngữ", 220, "Tiếng Việt + Tiếng Anh", "Tiếng Việt", "Tiếng Anh");
@@ -1208,9 +1619,60 @@ namespace PdfTool
                 tools.Add(t);
             }
 
+            // --- Word sang PDF
+            {
+                var t = new ToolDef { Name = "Word sang PDF", Glyph = "W", Group = "Chuyển đổi Office", Color = Color.FromArgb(43, 87, 154), Input = FileKind.Word,
+                    Desc = "Chuyển văn bản Word (DOC, DOCX, RTF, ODT) sang PDF, giữ nguyên bố cục, phông chữ và liên kết. Cần Microsoft Word trên máy." };
+                var o = t.Options = new Opts(scale);
+                var quality = o.Combo("Chất lượng", 260, "In ấn (chất lượng cao)", "Xem trên màn hình (file nhỏ hơn)");
+                var marks = o.Check("Tạo dấu trang (bookmark) từ các đề mục", true);
+                t.Prepare = () =>
+                {
+                    bool screen = quality.SelectedIndex == 1, b = marks.Checked;
+                    return job => Ops.WordToPdf(job, screen, b);
+                };
+                tools.Add(t);
+            }
+
+            // --- Excel sang PDF
+            {
+                var t = new ToolDef { Name = "Excel sang PDF", Glyph = "X", Group = "Chuyển đổi Office", Color = Color.FromArgb(33, 115, 70), Input = FileKind.Excel,
+                    Desc = "Chuyển bảng tính Excel (XLS, XLSX, CSV, ODS) sang PDF theo thiết lập trang in trong file. Cần Microsoft Excel trên máy." };
+                var o = t.Options = new Opts(scale);
+                var scope = o.Combo("Phạm vi", 260, "Tất cả trang tính", "Chỉ trang tính đang chọn khi lưu file");
+                var fit = o.Check("Co mỗi trang tính vừa chiều ngang trang giấy", false);
+                o.Note("Trang tính bị ẩn không được xuất. Vùng in (Print Area) đã đặt trong file vẫn được giữ. File gốc không bị thay đổi.");
+                t.Prepare = () =>
+                {
+                    bool active = scope.SelectedIndex == 1, f = fit.Checked;
+                    return job => Ops.ExcelToPdf(job, active, f);
+                };
+                tools.Add(t);
+            }
+
+            // --- PowerPoint sang PDF
+            {
+                var t = new ToolDef { Name = "PowerPoint sang PDF", Glyph = "P", Group = "Chuyển đổi Office", Color = Color.FromArgb(196, 62, 28), Input = FileKind.PowerPoint,
+                    Desc = "Chuyển bài trình chiếu PowerPoint (PPT, PPTX, PPS, ODP) sang PDF, mỗi trang chiếu thành một trang. Cần Microsoft PowerPoint trên máy." };
+                var o = t.Options = new Opts(scale);
+                o.Note("Các bài trình chiếu bạn đang mở trong PowerPoint không bị ảnh hưởng.");
+                t.Prepare = () => job => Ops.PowerPointToPdf(job);
+                tools.Add(t);
+            }
+
+            // --- PDF sang Word
+            {
+                var t = new ToolDef { Name = "PDF sang Word", Glyph = "\uE932", Group = "Chuyển đổi Office", Color = Color.FromArgb(24, 90, 189),
+                    Desc = "Chuyển PDF thành văn bản Word (DOCX) có thể chỉnh sửa, dùng tính năng đọc PDF của Microsoft Word 2013 trở lên." };
+                var o = t.Options = new Opts(scale);
+                o.Note("Bố cục phức tạp (bảng, nhiều cột, chữ trên hình) có thể bị lệch so với bản gốc. PDF scan chỉ có hình ảnh nên Word không lấy ra được chữ.");
+                t.Prepare = () => job => Ops.PdfToWord(job);
+                tools.Add(t);
+            }
+
             // --- Đánh số trang
             {
-                var t = new ToolDef { Name = "Đánh số trang", Short = "SỐ", Color = Color.FromArgb(73, 130, 5),
+                var t = new ToolDef { Name = "Đánh số trang", Glyph = "123", Group = "Chỉnh sửa", Color = Color.FromArgb(101, 163, 13),
                     Desc = "Thêm số trang vào đầu hoặc cuối mỗi trang." };
                 var o = t.Options = new Opts(scale);
                 var pos = o.Combo("Vị trí", 220, "Dưới - giữa", "Dưới - phải", "Dưới - trái", "Trên - giữa", "Trên - phải", "Trên - trái");
@@ -1232,7 +1694,7 @@ namespace PdfTool
 
             // --- Đóng dấu chữ (watermark)
             {
-                var t = new ToolDef { Name = "Đóng dấu chữ (watermark)", Short = "DẤU", Color = Color.FromArgb(194, 57, 179),
+                var t = new ToolDef { Name = "Đóng dấu chữ (watermark)", Glyph = "\uE8D2", Group = "Chỉnh sửa", Color = Color.FromArgb(192, 38, 211),
                     Desc = "Đóng dấu chữ mờ lên giữa tất cả các trang, ví dụ \"BẢN SAO\", \"MẬT\", tên công ty." };
                 var o = t.Options = new Opts(scale);
                 var text = o.Input("Nội dung", 300, "BẢN SAO", null);
@@ -1245,7 +1707,7 @@ namespace PdfTool
                     string s = text.Text.Trim();
                     if (s.Length == 0) { Warn("Hãy nhập nội dung dấu."); return null; }
                     float sz = (float)size.Value, a = new[] { 45f, 0f, 90f }[angle.SelectedIndex];
-                    Color c = color.BackColor;
+                    Color c = color.Value;
                     int op = (int)opacity.Value;
                     return job => Ops.Watermark(job, s, sz, c, op, a);
                 };
@@ -1254,7 +1716,7 @@ namespace PdfTool
 
             // --- Đặt mật khẩu
             {
-                var t = new ToolDef { Name = "Đặt mật khẩu", Short = "KHÓA", Color = Color.FromArgb(118, 118, 118),
+                var t = new ToolDef { Name = "Đặt mật khẩu", Glyph = "\uE72E", Group = "Bảo mật", Color = Color.FromArgb(71, 85, 105),
                     Desc = "Mã hóa PDF bằng AES-256: cần mật khẩu để mở, và/hoặc hạn chế in, sao chép, chỉnh sửa." };
                 var o = t.Options = new Opts(scale);
                 var user = o.Input("Mật khẩu mở file", 220, "", "để trống nếu chỉ muốn hạn chế quyền", true);
@@ -1277,7 +1739,7 @@ namespace PdfTool
 
             // --- Gỡ mật khẩu
             {
-                var t = new ToolDef { Name = "Gỡ mật khẩu", Short = "MỞ", Color = Color.FromArgb(96, 94, 92),
+                var t = new ToolDef { Name = "Gỡ mật khẩu", Glyph = "\uE785", Group = "Bảo mật", Color = Color.FromArgb(100, 116, 139),
                     Desc = "Tạo bản PDF không còn mật khẩu và hạn chế (cần biết mật khẩu nếu file yêu cầu mật khẩu khi mở)." };
                 var o = t.Options = new Opts(scale);
                 var pw = o.Input("Mật khẩu", 220, "", "để trống nếu file mở được mà không cần mật khẩu", true);
@@ -1303,24 +1765,27 @@ namespace PdfTool
         Job running;
         Thread worker;
         string lastResult;
-        float scale = 1f;
+        int hoverItem = -1, lastToolIndex = -1;
 
         ListBox lstTools;
         Label lblTitle, lblDesc;
-        ListView lvFiles;
+        IconBadge badge;
+        Card cardFiles;
+        FileList lvFiles;
+        ImageList fileIcons;
+        DropHint dropHint;
         Panel pnlOptions;
-        RadioButton rbSame, rbOther;
+        FRadio rbSame, rbOther;
         TextBox txtOut;
-        Button btnAdd, btnRemove, btnUp, btnDown, btnClear, btnBrowse, btnRun, btnCancel, btnOpen;
+        FButton btnAdd, btnRemove, btnUp, btnDown, btnClear, btnBrowse, btnRun, btnCancel, btnOpen;
         TextBox txtLog;
-        ProgressBar progress;
+        ThinProgress progress;
 
-        int S(int v) { return (int)(v * scale); }
+        static int S(int v) { return Theme.S(v); }
 
         public ToolboxView(float scale)
         {
-            this.scale = scale;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.Ui(10f);
             AllowDrop = true;
             DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) && running == null ? DragDropEffects.Copy : DragDropEffects.None;
             DragDrop += (s, e) => AddFiles((string[])e.Data.GetData(DataFormats.FileDrop));
@@ -1340,151 +1805,256 @@ namespace PdfTool
             Ext.Kill(worker);
         }
 
-        Button MakeButton(string text, EventHandler onClick, int width)
+        static FButton Btn(string text, string glyph, ButtonKind kind, string tip, EventHandler click)
         {
-            var b = new Button { Text = text, Width = S(width), Height = S(30), Margin = new Padding(S(2)) };
-            b.Click += onClick;
+            var b = new FButton(text, glyph, kind);
+            if (tip != null) Theme.Tip(b, tip);
+            b.Click += click;
             return b;
-        }
-
-        GroupBox Group(string text)
-        {
-            return new GroupBox { Text = text, Dock = DockStyle.Fill, Padding = new Padding(S(8), S(4), S(8), S(6)), Margin = new Padding(S(4)) };
         }
 
         void BuildUi()
         {
-            // --- Danh sách công cụ bên trái
-            lstTools = new ListBox
+            Theme.Bg(this, Role.Window);
+
+            // --- Thanh bên: danh sách công cụ theo nhóm
+            lstTools = new ListBox { Dock = DockStyle.Fill, DrawMode = DrawMode.OwnerDrawVariable, BorderStyle = BorderStyle.None, IntegralHeight = false };
+            Theme.Bg(lstTools, Role.Surface);
+            Theme.Native(lstTools);
+            string group = null;
+            foreach (var t in tools)
             {
-                Dock = DockStyle.Left, Width = S(250), DrawMode = DrawMode.OwnerDrawFixed, ItemHeight = S(46),
-                BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(243, 243, 243), IntegralHeight = false
-            };
-            foreach (var t in tools) lstTools.Items.Add(t);
+                if (t.Group != group) { group = t.Group; lstTools.Items.Add(group); }
+                lstTools.Items.Add(t);
+            }
+            lstTools.MeasureItem += (s, e) => e.ItemHeight = lstTools.Items[e.Index] is string ? S(e.Index == 0 ? 28 : 40) : S(44);
             lstTools.DrawItem += DrawTool;
-            lstTools.SelectedIndexChanged += (s, e) => ShowTool(lstTools.SelectedItem as ToolDef);
+            lstTools.SelectedIndexChanged += (s, e) => OnToolSelected();
+            lstTools.MouseMove += (s, e) =>
+            {
+                int i = lstTools.IndexFromPoint(e.Location);
+                if (i == hoverItem) return;
+                int old = hoverItem;
+                hoverItem = i;
+                InvalidateItem(old);
+                InvalidateItem(i);
+            };
+            lstTools.MouseLeave += (s, e) => { int old = hoverItem; hoverItem = -1; InvalidateItem(old); };
 
-            // --- Khu vực bên phải
-            var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(S(10), S(6), S(10), S(6)) };
-            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // tiêu đề
-            right.RowStyles.Add(new RowStyle(SizeType.Percent, 55));    // danh sách file
-            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // tùy chọn
-            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // thư mục lưu
-            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));       // nút thực hiện
-            right.RowStyles.Add(new RowStyle(SizeType.Percent, 45));    // nhật ký
+            var sidebar = new Panel { Dock = DockStyle.Left, Width = S(272), Padding = new Padding(S(8), S(6), S(8), 0) };
+            Theme.Bg(sidebar, Role.Surface);
+            sidebar.Controls.Add(lstTools);
+            sidebar.Controls.Add(new DonatePanel(1f));
+            var sideLine = new Panel { Dock = DockStyle.Left, Width = 1 };
+            Theme.Bg(sideLine, Role.Divider);
 
-            var head = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Dock = DockStyle.Fill, Margin = new Padding(S(4), 0, S(4), S(4)) };
-            lblTitle = new Label { AutoSize = true, Font = new Font("Segoe UI Semibold", 16f), Margin = new Padding(0) };
-            lblDesc = new Label { AutoSize = true, ForeColor = Color.DimGray, Margin = new Padding(S(2), S(2), 0, S(2)) };
-            head.Controls.Add(lblTitle);
-            head.Controls.Add(lblDesc);
-            right.Resize += (s, e) => lblDesc.MaximumSize = new Size(Math.Max(S(200), right.ClientSize.Width - S(40)), 0);
+            // --- Nội dung
+            // Vùng nội dung: cuộn được khi cửa sổ thấp hơn chiều cao tối thiểu
+            scrollHost = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
+            Theme.Bg(scrollHost, Role.Window);
+            Theme.Native(scrollHost);
+            content = new TableLayoutPanel { Location = Point.Empty, ColumnCount = 1, RowCount = 2, Padding = new Padding(S(18), S(16), S(18), S(14)) };
+            Theme.Bg(content, Role.Window);
+            scrollHost.Controls.Add(content);
+            scrollHost.Resize += (s, e) => FitContent();
+            content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            content.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-            // Danh sách file
-            var gFiles = Group("File cần xử lý (kéo thả file vào cửa sổ)");
-            lvFiles = new ListView { Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HideSelection = false, AllowDrop = true };
-            lvFiles.Columns.Add("Tên file", S(330));
-            lvFiles.Columns.Add("Kích thước", S(90), HorizontalAlignment.Right);
-            lvFiles.Columns.Add("Thư mục", S(330));
-            lvFiles.DragEnter += (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) && running == null ? DragDropEffects.Copy : DragDropEffects.None;
-            lvFiles.DragDrop += (s, e) => AddFiles((string[])e.Data.GetData(DataFormats.FileDrop));
-            lvFiles.SelectedIndexChanged += (s, e) => UpdateButtons();
+            var head = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, AutoSize = true, Margin = new Padding(S(6), 0, S(6), S(10)) };
+            head.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            head.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            badge = new IconBadge { Size = new Size(S(52), S(52)), Margin = new Padding(0, S(2), S(16), 0), Anchor = AnchorStyles.Left | AnchorStyles.Top };
+            var titles = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Dock = DockStyle.Fill, Margin = new Padding(0) };
+            lblTitle = new Label { AutoSize = true, Font = Theme.UiSemi(18f), Margin = new Padding(0) };
+            lblDesc = new Label { AutoSize = true, Font = Theme.Ui(10f), Margin = new Padding(S(2), S(2), 0, 0) };
+            Theme.Fg(lblDesc, TextRole.Muted);
+            titles.Controls.Add(lblTitle);
+            titles.Controls.Add(lblDesc);
+            head.Controls.Add(badge, 0, 0);
+            head.Controls.Add(titles, 1, 0);
+            content.Resize += (s, e) => lblDesc.MaximumSize = new Size(Math.Max(S(200), content.ClientSize.Width - S(120)), 0);
+
+            var body = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = new Padding(0) };
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 52));
+            body.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 48));
+            body.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+            // Thẻ danh sách file
+            cardFiles = new Card("Tệp cần xử lý", "") { Dock = DockStyle.Fill };
+            var fileBar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = true, Margin = new Padding(0), Padding = new Padding(0, 0, 0, S(8)) };
+            btnAdd = Btn("Thêm file", "", ButtonKind.Standard, "Chọn file để thêm vào danh sách", (s, e) => BrowseFiles());
+            btnRemove = Btn("Bỏ file", "", ButtonKind.Subtle, "Bỏ các file đang chọn khỏi danh sách (Delete)", (s, e) => RemoveSelected());
+            btnUp = Btn(null, "", ButtonKind.Subtle, "Đưa lên trên", (s, e) => MoveSelected(-1));
+            btnDown = Btn(null, "", ButtonKind.Subtle, "Đưa xuống dưới", (s, e) => MoveSelected(1));
+            btnClear = Btn("Bỏ tất cả", "", ButtonKind.Subtle, "Bỏ tất cả file khỏi danh sách", (s, e) => { tool.Files.Clear(); RefreshFiles(); });
+            fileBar.Controls.AddRange(new Control[] { btnAdd, btnRemove, btnUp, btnDown, btnClear });
+
+            var listHost = new Panel { Dock = DockStyle.Fill };
+            fileIcons = new ImageList { ColorDepth = ColorDepth.Depth32Bit, ImageSize = new Size(S(16), S(16)) };
+            lvFiles = new FileList { Dock = DockStyle.Fill, AllowDrop = true, FillColumn = 2, ClickableHeader = false, Images = fileIcons };
+            Theme.Bg(lvFiles, Role.Surface);
+            lvFiles.Columns.Add(new FileList.Column { Text = "Tên file", Width = S(250) });
+            lvFiles.Columns.Add(new FileList.Column { Text = "Kích thước", Width = S(90), Right = true });
+            lvFiles.Columns.Add(new FileList.Column { Text = "Thư mục", Width = S(200) });
+            DragEventHandler enter = (s, e) => e.Effect = e.Data.GetDataPresent(DataFormats.FileDrop) && running == null ? DragDropEffects.Copy : DragDropEffects.None;
+            DragEventHandler drop = (s, e) => AddFiles((string[])e.Data.GetData(DataFormats.FileDrop));
+            lvFiles.DragEnter += enter;
+            lvFiles.DragDrop += drop;
+            lvFiles.SelectionChanged += (s, e) => UpdateButtons();
             lvFiles.KeyDown += (s, e) => { if (e.KeyCode == Keys.Delete) RemoveSelected(); };
-            var fileBtns = new FlowLayoutPanel { Dock = DockStyle.Right, FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Padding = new Padding(S(6), 0, 0, 0) };
-            btnAdd = MakeButton("Thêm file...", (s, e) => BrowseFiles(), 130);
-            btnRemove = MakeButton("Bỏ khỏi danh sách", (s, e) => RemoveSelected(), 130);
-            btnUp = MakeButton("▲ Lên", (s, e) => MoveSelected(-1), 130);
-            btnDown = MakeButton("▼ Xuống", (s, e) => MoveSelected(1), 130);
-            btnClear = MakeButton("Bỏ tất cả", (s, e) => { tool.Files.Clear(); RefreshFiles(); }, 130);
-            fileBtns.Controls.AddRange(new Control[] { btnAdd, btnRemove, btnUp, btnDown, btnClear });
-            gFiles.Controls.Add(lvFiles);
-            gFiles.Controls.Add(fileBtns);
+            dropHint = new DropHint { Dock = DockStyle.Fill, AllowDrop = true };
+            dropHint.Click += (s, e) => { if (running == null) BrowseFiles(); };
+            dropHint.DragEnter += enter;
+            dropHint.DragDrop += drop;
+            listHost.Controls.Add(dropHint);
+            listHost.Controls.Add(lvFiles);
+            cardFiles.Controls.Add(listHost);
+            cardFiles.Controls.Add(fileBar);
 
-            // Tùy chọn
-            var gOpt = Group("Tùy chọn");
-            gOpt.AutoSize = true;
-            pnlOptions = new Panel { Dock = DockStyle.Fill, AutoSize = true };
-            gOpt.Controls.Add(pnlOptions);
+            // Cột phải: tùy chọn, nơi lưu, nút thực hiện, nhật ký
+            var right = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, Margin = new Padding(0) };
+            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            right.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
-            // Thư mục lưu
-            var gOut = Group("Lưu kết quả");
-            gOut.AutoSize = true;
-            var outFlow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
-            rbSame = new RadioButton { Text = "Cùng thư mục với file gốc", AutoSize = true, Checked = true, Margin = new Padding(S(3), S(7), S(12), S(3)) };
-            rbOther = new RadioButton { Text = "Thư mục:", AutoSize = true, Margin = new Padding(S(3), S(7), S(3), S(3)) };
-            txtOut = new TextBox { Width = S(380), Margin = new Padding(S(3), S(5), S(3), S(3)) };
-            btnBrowse = MakeButton("...", (s, e) => BrowseOut(), 34);
-            btnBrowse.Height = S(26);
+            var cardOpt = new Card("Tùy chọn", "") { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            pnlOptions = new Panel { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            cardOpt.Controls.Add(pnlOptions);
+
+            var cardOut = new Card("Lưu kết quả", "") { Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            var outGrid = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            outGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            outGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            outGrid.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            rbSame = new FRadio("Cùng thư mục với file gốc", true) { Margin = new Padding(0, 0, 0, S(8)) };
+            rbOther = new FRadio("Thư mục khác:", false) { Anchor = AnchorStyles.Left, Margin = new Padding(0, 0, S(10), 0) };
+            txtOut = new TextBox();
+            var outField = new FieldHost(txtOut) { Anchor = AnchorStyles.Left | AnchorStyles.Right, Margin = new Padding(0), LeadingGlyph = "" };
+            btnBrowse = Btn(null, "", ButtonKind.Standard, "Chọn thư mục lưu kết quả", (s, e) => BrowseOut());
+            btnBrowse.Anchor = AnchorStyles.Left;
+            btnBrowse.Margin = new Padding(S(6), 0, 0, 0);
+            btnBrowse.Size = new Size(outField.Height, outField.Height);
+            outGrid.Controls.Add(rbSame, 0, 0);
+            outGrid.SetColumnSpan(rbSame, 3);
+            outGrid.Controls.Add(rbOther, 0, 1);
+            outGrid.Controls.Add(outField, 1, 1);
+            outGrid.Controls.Add(btnBrowse, 2, 1);
             txtOut.TextChanged += (s, e) => { if (txtOut.Focused) rbOther.Checked = true; };
-            outFlow.Controls.AddRange(new Control[] { rbSame, rbOther, txtOut, btnBrowse });
-            gOut.Controls.Add(outFlow);
+            cardOut.Controls.Add(outGrid);
 
-            // Nút thực hiện
-            var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = false, Margin = new Padding(S(4), S(6), S(4), S(2)) };
-            btnRun = MakeButton("THỰC HIỆN", (s, e) => RunTool(), 200);
-            btnRun.Height = S(40);
-            btnRun.Font = new Font(Font.FontFamily, 11f, FontStyle.Bold);
-            btnRun.BackColor = Color.FromArgb(0, 120, 212);
-            btnRun.ForeColor = Color.White;
-            btnRun.FlatStyle = FlatStyle.Flat;
-            btnCancel = MakeButton("Dừng", (s, e) => CancelRunning(), 90);
+            var actions = new WrapFlow { Dock = DockStyle.Fill, AutoSize = true, Margin = new Padding(S(6), S(8), S(6), S(8)) };
+            btnRun = Btn("Thực hiện", "", ButtonKind.Primary, "Bắt đầu xử lý các file trong danh sách", (s, e) => RunTool());
+            btnRun.Font = Theme.UiSemi(10.5f);
+            btnRun.Size = new Size(Math.Max(S(160), btnRun.GetPreferredSize(Size.Empty).Width), S(40));
+            btnCancel = Btn("Dừng", "", ButtonKind.Standard, "Dừng công việc đang chạy", (s, e) => CancelRunning());
             btnCancel.Height = S(40);
-            btnOpen = MakeButton("Mở thư mục kết quả", (s, e) => OpenResult(), 160);
+            btnOpen = Btn("Mở thư mục kết quả", "", ButtonKind.Standard, "Mở thư mục chứa file vừa tạo", (s, e) => OpenResult());
             btnOpen.Height = S(40);
-            progress = new ProgressBar { Style = ProgressBarStyle.Marquee, Width = S(160), Height = S(18), Visible = false, Margin = new Padding(S(12), S(13), S(3), S(3)) };
+            btnRun.Margin = btnCancel.Margin = btnOpen.Margin = new Padding(0, 0, S(8), S(6));
+            progress = new ThinProgress { Visible = false, Margin = new Padding(S(10), S(18), 0, 0) };
             actions.Controls.AddRange(new Control[] { btnRun, btnCancel, btnOpen, progress });
 
-            // Nhật ký
+            var cardLog = new Card("Nhật ký", "") { Dock = DockStyle.Fill };
             txtLog = new TextBox
             {
                 Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
-                BackColor = Color.White, Font = new Font("Consolas", 9f), Margin = new Padding(S(4))
+                BorderStyle = BorderStyle.None, Font = Theme.Mono(9.5f)
             };
+            Theme.Bg(txtLog, Role.Surface);
+            cardLog.Controls.Add(txtLog);
 
-            right.Controls.Add(head, 0, 0);
-            right.Controls.Add(gFiles, 0, 1);
-            right.Controls.Add(gOpt, 0, 2);
-            right.Controls.Add(gOut, 0, 3);
-            right.Controls.Add(actions, 0, 4);
-            right.Controls.Add(txtLog, 0, 5);
+            right.Controls.Add(cardOpt, 0, 0);
+            right.Controls.Add(cardOut, 0, 1);
+            right.Controls.Add(actions, 0, 2);
+            right.Controls.Add(cardLog, 0, 3);
+            body.Controls.Add(cardFiles, 0, 0);
+            body.Controls.Add(right, 1, 0);
+            content.Controls.Add(head, 0, 0);
+            content.Controls.Add(body, 0, 1);
 
-            Controls.Add(right);
-            Controls.Add(new Panel { Dock = DockStyle.Left, Width = 1, BackColor = Color.FromArgb(220, 220, 220) });
-            Controls.Add(lstTools);
-            lstTools.SelectedIndex = 0;
+            this.head = head;
+            this.right = right;
+            this.cardOpt = cardOpt;
+            this.cardOut = cardOut;
+            this.actions = actions;
+            Controls.Add(scrollHost);
+            Controls.Add(sideLine);
+            Controls.Add(sidebar);
+            lstTools.SelectedItem = tools[0];
+        }
+
+        Panel scrollHost;
+        TableLayoutPanel content, head, right;
+        Card cardOpt, cardOut;
+        FlowLayoutPanel actions;
+
+        // Chiều cao tối thiểu = tiêu đề + các thẻ bên phải + chỗ cho nhật ký; thấp hơn thì hiện thanh cuộn
+        void FitContent()
+        {
+            if (content == null || scrollHost.Width <= 0) return;
+            int fullW = scrollHost.Width, fullH = scrollHost.Height;
+            int rightW = Math.Max(S(200), (int)((fullW - content.Padding.Horizontal) * 0.48));
+            int need = content.Padding.Vertical + head.GetPreferredSize(new Size(fullW, 0)).Height + head.Margin.Vertical +
+                       cardOpt.GetPreferredSize(new Size(rightW, 0)).Height + cardOpt.Margin.Vertical +
+                       cardOut.GetPreferredSize(new Size(rightW, 0)).Height + cardOut.Margin.Vertical +
+                       actions.GetPreferredSize(new Size(rightW, 0)).Height + actions.Margin.Vertical + S(170);
+            bool scroll = need > fullH;
+            int w = fullW - (scroll ? SystemInformation.VerticalScrollBarWidth : 0);
+            scrollHost.AutoScrollMinSize = scroll ? new Size(0, need) : Size.Empty;
+            content.SetBounds(scrollHost.AutoScrollPosition.X, scrollHost.AutoScrollPosition.Y, w, scroll ? need : fullH);
+        }
+
+        void InvalidateItem(int i)
+        {
+            if (i >= 0 && i < lstTools.Items.Count) lstTools.Invalidate(lstTools.GetItemRectangle(i));
+        }
+
+        // Không cho chọn dòng tiêu đề nhóm; không đổi công cụ khi đang xử lý
+        void OnToolSelected()
+        {
+            int i = lstTools.SelectedIndex;
+            if (i < 0) return;
+            if (lstTools.Items[i] is string)
+            {
+                int dir = i < lastToolIndex ? -1 : 1;
+                for (int pass = 0; pass < 2; pass++, dir = -dir)
+                    for (int j = i + dir; j >= 0 && j < lstTools.Items.Count; j += dir)
+                        if (!(lstTools.Items[j] is string)) { lstTools.SelectedIndex = j; return; }
+                return;
+            }
+            if (running != null && lastToolIndex >= 0 && i != lastToolIndex) { lstTools.SelectedIndex = lastToolIndex; return; }
+            lastToolIndex = i;
+            ShowTool((ToolDef)lstTools.Items[i]);
         }
 
         void DrawTool(object sender, DrawItemEventArgs e)
         {
             if (e.Index < 0) return;
+            var g = e.Graphics;
+            var p = Theme.P;
+            using (var b = new SolidBrush(p.Surface)) g.FillRectangle(b, e.Bounds);
+            var header = lstTools.Items[e.Index] as string;
+            if (header != null)
+            {
+                TextRenderer.DrawText(g, header.ToUpper(CultureInfo.CurrentCulture), Theme.UiSemi(8.5f),
+                    new Rectangle(e.Bounds.X + S(12), e.Bounds.Bottom - S(24), e.Bounds.Width - S(12), S(20)), p.TextMuted, Theme.TextLeft);
+                return;
+            }
             var t = (ToolDef)lstTools.Items[e.Index];
             bool sel = (e.State & DrawItemState.Selected) != 0;
-            var g = e.Graphics;
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
-            using (var bg = new SolidBrush(sel ? Color.FromArgb(204, 228, 247) : lstTools.BackColor)) g.FillRectangle(bg, e.Bounds);
-            if (sel) using (var bar = new SolidBrush(Color.FromArgb(0, 120, 212))) g.FillRectangle(bar, e.Bounds.X, e.Bounds.Y + S(6), S(3), e.Bounds.Height - S(12));
-
-            var icon = new Rectangle(e.Bounds.X + S(12), e.Bounds.Y + S(7), S(32), S(32));
-            using (var path = RoundRect(icon, S(6)))
-            using (var b = new SolidBrush(t.Color)) g.FillPath(b, path);
-            using (var f = new Font("Segoe UI", t.Short.Length > 3 ? 6.5f : 7.5f, FontStyle.Bold))
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                g.DrawString(t.Short, f, Brushes.White, icon, sf);
-            var textRect = new Rectangle(icon.Right + S(10), e.Bounds.Y, e.Bounds.Width - icon.Right - S(12), e.Bounds.Height);
-            TextRenderer.DrawText(g, t.Name, Font, textRect, Color.FromArgb(32, 32, 32), TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis);
-        }
-
-        static GraphicsPath RoundRect(Rectangle r, int rad)
-        {
-            var p = new GraphicsPath();
-            int d = rad * 2;
-            p.AddArc(r.X, r.Y, d, d, 180, 90);
-            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            p.CloseFigure();
-            return p;
+            var row = new RectangleF(e.Bounds.X + S(2), e.Bounds.Y + S(2), e.Bounds.Width - S(4), e.Bounds.Height - S(4));
+            if (sel)
+            {
+                Theme.FillRound(g, row, S(6), p.Dark ? Color.FromArgb(255, 0x38, 0x38, 0x38) : Color.FromArgb(255, 0xEC, 0xEC, 0xEC), Color.Empty, 0);
+                Theme.FillRound(g, new RectangleF(row.X, row.Y + row.Height / 2 - S(9), S(3), S(18)), Theme.Sf(1.5f), p.Accent, Color.Empty, 0);
+            }
+            else if (e.Index == hoverItem)
+                Theme.FillRound(g, row, S(6), p.Hover, Color.Empty, 0);
+            var icon = new RectangleF(row.X + S(12), row.Y + (row.Height - S(30)) / 2, S(30), S(30));
+            Theme.Badge(g, icon, t.Color, t.Glyph, 11f);
+            int x = (int)icon.Right + S(12);
+            TextRenderer.DrawText(g, t.Name, sel ? Theme.UiSemi(10f) : Theme.Ui(10f), new Rectangle(x, e.Bounds.Y, e.Bounds.Right - x - S(6), e.Bounds.Height), p.Text, Theme.TextLeft);
         }
 
         // ------------------------------------------------------------------
@@ -1494,16 +2064,24 @@ namespace PdfTool
             tool = t;
             lblTitle.Text = t.Name;
             lblDesc.Text = t.Desc;
+            badge.Fill = t.Color;
+            badge.Glyph = t.Glyph;
+            badge.Invalidate();
             pnlOptions.Controls.Clear();
             pnlOptions.Controls.Add(t.Options);
-            lvFiles.Parent.Text = (t.ImageInput ? "Ảnh cần chuyển" : t.MinFiles > 1 ? "Các file PDF cần gộp" : "File PDF cần xử lý") + " (kéo thả file vào cửa sổ)";
+            Theme.Apply(t.Options);
+            FitContent();
+            cardFiles.Title = t.MinFiles > 1 ? "Các file PDF cần gộp" : t.Input.Title;
+            dropHint.Title = "Kéo thả " + t.Input.Name + " vào đây";
+            dropHint.Sub = "hoặc bấm vào đây để chọn file" + (t.MinFiles > 1 ? " (cần ít nhất 2 file)" : "");
+            dropHint.Glyph = t.Input.Glyph;
             RefreshFiles();
         }
 
         bool Accepts(string path)
         {
             string ext = Path.GetExtension(path).ToLowerInvariant();
-            return tool.ImageInput ? ImageUtil.Extensions.Contains(ext) : ext == ".pdf";
+            return tool.Input.Extensions.Contains(ext);
         }
 
         public void AddFiles(IEnumerable<string> paths)
@@ -1521,64 +2099,63 @@ namespace PdfTool
             }
             RefreshFiles();
             if (skipped > 0)
-                Log("Bỏ qua " + skipped + " file không phải " + (tool.ImageInput ? "ảnh" : "PDF") + ".");
+                Log("Bỏ qua " + skipped + " file không phải " + tool.Input.Name + ".");
         }
 
         void BrowseFiles()
         {
             using (var d = new OpenFileDialog { Multiselect = true })
             {
-                d.Filter = tool.ImageInput
-                    ? "Ảnh (*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff)|*.jpg;*.jpeg;*.png;*.bmp;*.gif;*.tif;*.tiff|Tất cả file|*.*"
-                    : "File PDF (*.pdf)|*.pdf|Tất cả file|*.*";
+                d.Filter = tool.Input.Filter;
                 if (d.ShowDialog(this) == DialogResult.OK) AddFiles(d.FileNames);
             }
         }
 
         void RefreshFiles()
         {
-            var sel = lvFiles.SelectedIndices.Cast<int>().Select(i => tool.Files.ElementAtOrDefault(i)).ToList();
+            var sel = lvFiles.SelectedIndices.Select(i => tool.Files.ElementAtOrDefault(i)).ToList();
             lvFiles.BeginUpdate();
-            lvFiles.Items.Clear();
+            lvFiles.Clear();
             foreach (string f in tool.Files)
             {
                 string size = "";
                 try { size = Job.SizeText(new FileInfo(f).Length); } catch { }
-                var it = new ListViewItem(new[] { Path.GetFileName(f), size, Path.GetDirectoryName(f) });
-                it.Selected = sel.Contains(f);
-                lvFiles.Items.Add(it);
+                lvFiles.Add(new[] { Path.GetFileName(f), size, Path.GetDirectoryName(f) }, ShellIcons.Key(fileIcons, f, false, false), f, sel.Contains(f));
             }
             lvFiles.EndUpdate();
+            bool empty = tool.Files.Count == 0;
+            dropHint.Visible = empty;
+            lvFiles.Visible = !empty;
+            dropHint.Invalidate();
             UpdateButtons();
         }
 
         void RemoveSelected()
         {
-            foreach (int i in lvFiles.SelectedIndices.Cast<int>().OrderByDescending(i => i)) tool.Files.RemoveAt(i);
+            foreach (int i in lvFiles.SelectedIndices.OrderByDescending(i => i)) tool.Files.RemoveAt(i);
             RefreshFiles();
         }
 
         void MoveSelected(int dir)
         {
-            if (lvFiles.SelectedIndices.Count != 1) return;
-            int i = lvFiles.SelectedIndices[0], j = i + dir;
+            var si = lvFiles.SelectedIndices;
+            if (si.Count != 1) return;
+            int i = si[0], j = i + dir;
             if (j < 0 || j >= tool.Files.Count) return;
             string tmp = tool.Files[i]; tool.Files[i] = tool.Files[j]; tool.Files[j] = tmp;
             RefreshFiles();
-            lvFiles.SelectedIndices.Clear();
-            lvFiles.Items[j].Selected = true;
-            lvFiles.EnsureVisible(j);
+            lvFiles.SelectOnly(j);
         }
 
         void UpdateButtons()
         {
             bool idle = running == null;
-            int nsel = lvFiles.SelectedIndices.Count;
-            lstTools.Enabled = idle;
+            var si = lvFiles.SelectedIndices;
+            int nsel = si.Count;
             btnAdd.Enabled = btnBrowse.Enabled = idle;
             btnRemove.Enabled = idle && nsel > 0;
-            btnUp.Enabled = idle && nsel == 1 && lvFiles.SelectedIndices[0] > 0;
-            btnDown.Enabled = idle && nsel == 1 && lvFiles.SelectedIndices[0] < tool.Files.Count - 1;
+            btnUp.Enabled = idle && nsel == 1 && si[0] > 0;
+            btnDown.Enabled = idle && nsel == 1 && si[0] < tool.Files.Count - 1;
             btnClear.Enabled = idle && tool.Files.Count > 0;
             btnRun.Enabled = idle && tool.Files.Count >= tool.MinFiles;
             btnCancel.Enabled = !idle;
@@ -1617,7 +2194,7 @@ namespace PdfTool
             if (Ext.Gs == null) missing.Add("Ghostscript (nén, PDF sang ảnh, OCR...)");
             if (Ext.Tesseract == null) missing.Add("Tesseract (OCR)");
             if (missing.Count == 0)
-                Log("Sẵn sàng. Chọn công cụ bên trái, thêm file rồi bấm THỰC HIỆN.");
+                Log("Sẵn sàng. Chọn công cụ bên trái, thêm file rồi bấm Thực hiện.");
             else
                 Log("Thiếu công cụ: " + string.Join(", ", missing) + ".\r\nHãy cài PDF24 Creator, hoặc chép các thư mục qpdf, gs, tesseract vào thư mục \"tools\" cạnh PdfTool.exe.");
         }
@@ -1689,7 +2266,7 @@ namespace PdfTool
         // Nhận file từ thẻ "Soạn PDF"
         public void AddPdf(string path)
         {
-            if (tool.ImageInput) lstTools.SelectedIndex = 0;
+            if (tool.Input != FileKind.Pdf) lstTools.SelectedItem = tools[0];
             AddFiles(new[] { path });
         }
     }
@@ -1770,6 +2347,34 @@ namespace PdfTool
             DestroyIcon(info.hIcon);
             return key;
         }
+
+        [DllImport("shell32.dll")] static extern int SHGetSpecialFolderLocation(IntPtr hwnd, int csidl, out IntPtr pidl);
+        [DllImport("shell32.dll", EntryPoint = "SHGetFileInfoW")]
+        static extern IntPtr SHGetFileInfoPidl(IntPtr pidl, uint attr, ref SHFILEINFO info, uint size, uint flags);
+
+        // Biểu tượng của thư mục ảo (vd. CSIDL_DRIVES = 0x11 là "This PC")
+        public static string KeySpecial(ImageList list, int csidl)
+        {
+            string key = "<csidl" + csidl + ">";
+            if (list.Images.ContainsKey(key)) return key;
+            IntPtr pidl;
+            if (SHGetSpecialFolderLocation(IntPtr.Zero, csidl, out pidl) != 0) return null;
+            var info = new SHFILEINFO();
+            SHGetFileInfoPidl(pidl, 0, ref info, (uint)Marshal.SizeOf(info), SHGFI_ICON | SHGFI_SMALLICON | 0x8 /* SHGFI_PIDL */);
+            Marshal.FreeCoTaskMem(pidl);
+            if (info.hIcon == IntPtr.Zero) return null;
+            using (var ic = Icon.FromHandle(info.hIcon)) list.Images.Add(key, ic.ToBitmap());
+            DestroyIcon(info.hIcon);
+            return key;
+        }
+
+        // Tên hiển thị giống Explorer (vd. "Local Disk (C:)", "This PC", "Downloads")
+        public static string DisplayName(string path)
+        {
+            var info = new SHFILEINFO();
+            if (SHGetFileInfo(path, 0, ref info, (uint)Marshal.SizeOf(info), 0x200) == IntPtr.Zero) return null;
+            return string.IsNullOrEmpty(info.szDisplayName) ? null : info.szDisplayName;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1781,30 +2386,31 @@ namespace PdfTool
         {
             using (var f = new Form())
             {
-                float s;
-                using (var g = f.CreateGraphics()) s = g.DpiX / 96f;
+                Func<int, int> S = Theme.S;
                 f.Text = title;
-                f.Font = new Font("Segoe UI", 9f);
+                f.Font = Theme.Ui(10f);
                 f.FormBorderStyle = FormBorderStyle.FixedDialog;
                 f.StartPosition = FormStartPosition.CenterParent;
                 f.MinimizeBox = f.MaximizeBox = false;
                 f.ShowInTaskbar = false;
                 f.AutoSize = true;
                 f.AutoSizeMode = AutoSizeMode.GrowAndShrink;
-                f.Padding = new Padding((int)(12 * s));
+                f.Padding = new Padding(S(20), S(16), S(20), S(16));
                 var flow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, Dock = DockStyle.Fill };
-                flow.Controls.Add(new Label { Text = prompt, AutoSize = true, MaximumSize = new Size((int)(380 * s), 0) });
-                var tb = new TextBox { Text = value, Width = (int)(380 * s), UseSystemPasswordChar = password, Margin = new Padding(0, (int)(8 * s), 0, (int)(8 * s)) };
-                flow.Controls.Add(tb);
-                var btns = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Width = (int)(380 * s), Margin = new Padding(0) };
-                var cancel = new Button { Text = "Hủy", DialogResult = DialogResult.Cancel, Width = (int)(80 * s), Height = (int)(28 * s) };
-                var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Width = (int)(80 * s), Height = (int)(28 * s) };
+                flow.Controls.Add(new Label { Text = prompt, AutoSize = true, MaximumSize = new Size(S(380), 0), Margin = new Padding(0, 0, 0, S(10)) });
+                var tb = new TextBox { Text = value, UseSystemPasswordChar = password };
+                flow.Controls.Add(new FieldHost(tb) { Width = S(380), Margin = new Padding(0, 0, 0, S(18)) });
+                var btns = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, Size = new Size(S(380), S(36)), Margin = new Padding(0) };
+                var cancel = new FButton("Hủy", null, ButtonKind.Standard) { DialogResult = DialogResult.Cancel, Width = S(100), Margin = new Padding(0) };
+                var ok = new FButton("OK", null, ButtonKind.Primary) { DialogResult = DialogResult.OK, Width = S(100), Margin = new Padding(0, 0, S(8), 0) };
                 btns.Controls.Add(cancel);
                 btns.Controls.Add(ok);
                 flow.Controls.Add(btns);
                 f.Controls.Add(flow);
                 f.AcceptButton = ok;
                 f.CancelButton = cancel;
+                Theme.Apply(f);
+                f.Shown += (o, e) => { tb.Focus(); tb.SelectAll(); };
                 return f.ShowDialog(owner) == DialogResult.OK ? tb.Text : null;
             }
         }
@@ -1818,15 +2424,40 @@ namespace PdfTool
         readonly float scale;
         int S(int v) { return (int)(v * scale); }
         readonly TreeView tree;
-        readonly ListView list;
+        readonly FileList list;
         readonly TextBox address;
         readonly ImageList icons;
         readonly SplitContainer split;
         readonly System.Windows.Forms.Timer refreshTimer;
-        readonly Stack<string> history = new Stack<string>();
+        readonly Stack<string> history = new Stack<string>(), forward = new Stack<string>();
+        readonly FButton btnBack, btnForward, btnUp;
         FileSystemWatcher watcher;
         string current;
         public Action<string[]> OpenFiles;
+
+        static readonly string[] ColumnNames = { "Tên", "Ngày sửa", "Kích thước" };
+        int sortCol;           // 0 tên, 1 ngày sửa, 2 kích thước
+        bool sortDesc;
+        int lastHeaderCol = -1;
+        DateTime lastHeaderClick;
+
+        void UpdateHeaders()
+        {
+            for (int i = 0; i < ColumnNames.Length; i++) list.Columns[i].Text = ColumnNames[i];
+            list.Invalidate();
+        }
+
+        // Thư mục luôn đứng trước file; thư mục không có kích thước nên sắp theo tên
+        List<T> Sorted<T>(IEnumerable<T> items, bool dirs) where T : FileSystemInfo
+        {
+            var byName = StringComparer.CurrentCultureIgnoreCase;
+            if (sortCol == 1)
+                return (sortDesc ? items.OrderByDescending(x => x.LastWriteTime) : items.OrderBy(x => x.LastWriteTime)).ToList();
+            if (sortCol == 2 && !dirs)
+                return (sortDesc ? items.OrderByDescending(x => ((FileInfo)(FileSystemInfo)x).Length) : items.OrderBy(x => ((FileInfo)(FileSystemInfo)x).Length)).ToList();
+            if (sortCol == 2) return items.OrderBy(x => x.Name, byName).ToList();
+            return (sortDesc ? items.OrderByDescending(x => x.Name, byName) : items.OrderBy(x => x.Name, byName)).ToList();
+        }
 
         public string CurrentFolder { get { return current; } }
 
@@ -1839,25 +2470,32 @@ namespace PdfTool
         public FileBrowser(float scale)
         {
             this.scale = scale;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.Ui(10f);
+            Theme.Bg(this, Role.Surface);
             icons = new ImageList { ColorDepth = ColorDepth.Depth32Bit, ImageSize = new Size(S(16), S(16)) };
+            icons.Images.Add("<none>", new Bitmap(S(16), S(16)));
 
-            var bar = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 4, AutoSize = true, Padding = new Padding(S(2)) };
-            for (int i = 0; i < 3; i++) bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            // Thanh điều hướng: lùi, tiến, lên, làm mới, ô địa chỉ
+            var bar = new TableLayoutPanel { Dock = DockStyle.Top, ColumnCount = 5, RowCount = 1, AutoSize = true, Padding = new Padding(S(8), S(8), S(8), S(6)) };
+            Theme.Bg(bar, Role.Surface);
+            for (int i = 0; i < 4; i++) bar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
             bar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
-            var tip = new ToolTip();
-            Func<string, string, EventHandler, Button> btn = (text, hint, click) =>
+            Func<string, string, EventHandler, FButton> btn = (glyph, hint, click) =>
             {
-                var b = new Button { Text = text, Width = S(32), Height = S(26), Margin = new Padding(S(1), S(2), S(1), S(2)), FlatStyle = FlatStyle.Flat };
-                b.FlatAppearance.BorderSize = 0;
+                var b = new FButton(null, glyph, ButtonKind.Subtle) { Margin = new Padding(0, 0, S(2), 0), Anchor = AnchorStyles.Left };
                 b.Click += click;
-                tip.SetToolTip(b, hint);
+                Theme.Tip(b, hint);
                 return b;
             };
-            bar.Controls.Add(btn("←", "Quay lại", (s, e) => GoBack()), 0, 0);
-            bar.Controls.Add(btn("↑", "Lên thư mục cha", (s, e) => GoUp()), 1, 0);
-            bar.Controls.Add(btn("⟳", "Làm mới (F5)", (s, e) => Navigate(current, false)), 2, 0);
-            address = new TextBox { Dock = DockStyle.Fill, Margin = new Padding(S(3), S(4), S(3), S(3)) };
+            btnBack = btn("", "Quay lại (Alt + ←)", (s, e) => GoBack());
+            btnForward = btn("", "Tiến tới (Alt + →)", (s, e) => GoForward());
+            btnUp = btn("", "Lên thư mục cha (Backspace)", (s, e) => GoUp());
+            bar.Controls.Add(btnBack, 0, 0);
+            bar.Controls.Add(btnForward, 1, 0);
+            bar.Controls.Add(btnUp, 2, 0);
+            bar.Controls.Add(btn("", "Làm mới (F5)", (s, e) => Navigate(current, false)), 3, 0);
+            address = new TextBox();
+            var addressHost = new FieldHost(address) { Dock = DockStyle.Fill, Margin = new Padding(S(6), 0, 0, 0), LeadingGlyph = "" };
             address.KeyDown += (s, e) =>
             {
                 if (e.KeyCode != Keys.Enter) return;
@@ -1866,33 +2504,63 @@ namespace PdfTool
                 if (Directory.Exists(p)) Navigate(p, true);
                 else if (File.Exists(p) && Supported(p) && OpenFiles != null) OpenFiles(new[] { p });
             };
-            bar.Controls.Add(address, 3, 0);
+            bar.Controls.Add(addressHost, 4, 0);
 
-            split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1 };
-            tree = new TreeView { Dock = DockStyle.Fill, ImageList = icons, HideSelection = false, BorderStyle = BorderStyle.None, ShowLines = false, ItemHeight = S(22) };
+            split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1, SplitterWidth = S(5) };
+            Theme.Bg(split, Role.Surface);
+            split.Paint += (s, e) =>
+            {
+                var r = split.SplitterRectangle;
+                using (var pen = new Pen(Theme.P.Divider)) e.Graphics.DrawLine(pen, r.X + r.Width / 2, r.Y + S(4), r.X + r.Width / 2, r.Bottom - S(4));
+            };
+            tree = new NavTree
+            {
+                Dock = DockStyle.Fill, ImageList = icons, HideSelection = false, BorderStyle = BorderStyle.None,
+                ItemHeight = S(32), Indent = S(14)
+            };
+            Theme.Bg(tree, Role.Surface);
+            // Vẽ giống khung điều hướng của File Explorer (mũi tên, tô sáng khi rê chuột, vạch màu nhấn ở mục đang chọn)
+            TreeStyle.Setup(tree, Separator);
+            tree.BeforeSelect += (s, e) => { if (e.Node.Tag == Separator) e.Cancel = true; };
             tree.BeforeExpand += (s, e) => Populate(e.Node);
             tree.AfterSelect += (s, e) => { if (e.Action != TreeViewAction.Unknown && e.Node.Tag is string) Navigate((string)e.Node.Tag, true); };
 
-            list = new ListView
+            list = new FileList { Dock = DockStyle.Fill, Images = icons, FillColumn = 0 };
+            Theme.Bg(list, Role.Surface);
+            list.Columns.Add(new FileList.Column { Text = ColumnNames[0], Width = S(250) });
+            list.Columns.Add(new FileList.Column { Text = ColumnNames[1], Width = S(140) });
+            list.Columns.Add(new FileList.Column { Text = ColumnNames[2], Width = S(92), Right = true });
+            int.TryParse(Settings.Get("sortcol", "0"), out sortCol);
+            if (sortCol < 0 || sortCol >= ColumnNames.Length) sortCol = 0;
+            sortDesc = Settings.Get("sortdesc", "0") == "1";
+            list.SortState = col => col == sortCol ? (sortDesc ? 1 : 0) : -1;
+            // Bấm tiêu đề cột: sắp xếp theo cột đó, bấm lại để đảo chiều; nhấn đúp luôn về A→Z
+            list.HeaderClick += col =>
             {
-                Dock = DockStyle.Fill, View = View.Details, SmallImageList = icons, FullRowSelect = true,
-                HideSelection = false, BorderStyle = BorderStyle.None
+                var now = DateTime.Now;
+                bool dbl = col == lastHeaderCol && (now - lastHeaderClick).TotalMilliseconds <= SystemInformation.DoubleClickTime;
+                lastHeaderCol = col;
+                lastHeaderClick = dbl ? DateTime.MinValue : now;
+                if (dbl) sortDesc = false;
+                else if (col == sortCol) sortDesc = !sortDesc;
+                else { sortCol = col; sortDesc = false; }
+                Settings.Set("sortcol", sortCol.ToString());
+                Settings.Set("sortdesc", sortDesc ? "1" : "0");
+                UpdateHeaders();
+                Navigate(current, false);
             };
-            list.Columns.Add("Tên", S(250));
-            list.Columns.Add("Ngày sửa", S(115));
-            list.Columns.Add("Kích thước", S(75), HorizontalAlignment.Right);
-            list.ItemDrag += (s, e) =>
+            list.ItemDragStart += () =>
             {
                 var paths = Selection();
                 if (paths.Length > 0) list.DoDragDrop(new DataObject(DataFormats.FileDrop, paths), DragDropEffects.Copy);
             };
-            list.DoubleClick += (s, e) => OpenSelected();
+            list.ItemActivate += (s, e) => OpenSelected();
             list.KeyDown += (s, e) =>
             {
-                if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; OpenSelected(); }
-                else if (e.KeyCode == Keys.Back) GoUp();
+                if (e.KeyCode == Keys.Back) GoUp();
                 else if (e.KeyCode == Keys.F5) Navigate(current, false);
-                else if (e.Control && e.KeyCode == Keys.A) foreach (ListViewItem it in list.Items) it.Selected = true;
+                else if (e.Alt && e.KeyCode == Keys.Left) GoBack();
+                else if (e.Alt && e.KeyCode == Keys.Right) GoForward();
             };
 
             split.Panel1.Controls.Add(tree);
@@ -1908,14 +2576,14 @@ namespace PdfTool
             {
                 if (sized || split.Width < S(400)) return;
                 sized = true;
-                try { split.SplitterDistance = S(190); } catch { }
+                try { split.SplitterDistance = S(210); } catch { }
             };
             AddRoots();
         }
 
         string[] Selection()
         {
-            return list.SelectedItems.Cast<ListViewItem>().Select(i => i.Tag as string).Where(p => p != null).ToArray();
+            return list.SelectedRows.Select(r => r.Tag as string).Where(p => p != null).ToArray();
         }
 
         void OpenSelected()
@@ -1926,37 +2594,129 @@ namespace PdfTool
             if (files.Length > 0 && OpenFiles != null) OpenFiles(files);
         }
 
-        void AddRoots()
+        static readonly object Separator = new object();
+        const string ThisPc = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+
+        [DllImport("shell32.dll")]
+        static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out IntPtr path);
+
+        static string KnownFolder(string guid)
         {
-            string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-            AddRoot("Desktop", Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory));
-            AddRoot("Tài liệu (Documents)", Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments));
-            AddRoot("Tải về (Downloads)", Path.Combine(profile, "Downloads"));
-            AddRoot("Ảnh (Pictures)", Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
-            foreach (var d in DriveInfo.GetDrives())
-            {
-                try
-                {
-                    if (!d.IsReady) continue;
-                    string label = d.VolumeLabel;
-                    AddRoot((label.Length > 0 ? label + " " : "") + "(" + d.Name.TrimEnd('\\') + ")", d.RootDirectory.FullName);
-                }
-                catch { }
-            }
+            IntPtr p;
+            if (SHGetKnownFolderPath(new Guid(guid), 0, IntPtr.Zero, out p) != 0) return null;
+            string s = Marshal.PtrToStringUni(p);
+            Marshal.FreeCoTaskMem(p);
+            return s;
         }
 
-        void AddRoot(string text, string path)
+        // Thư mục trong "Truy cập nhanh" (Quick access) của Explorer, theo đúng thứ tự
+        static List<string> QuickAccessFolders()
+        {
+            var list = new List<string>();
+            try
+            {
+                Func<object, string, BindingFlags, object[], object> call = (o, name, f, a) => o.GetType().InvokeMember(name, f, null, o, a);
+                object shell = Activator.CreateInstance(Type.GetTypeFromProgID("Shell.Application"));
+                object ns = call(shell, "NameSpace", BindingFlags.InvokeMethod, new object[] { "shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}" });
+                object items = call(ns, "Items", BindingFlags.InvokeMethod, null);
+                int n = Convert.ToInt32(call(items, "Count", BindingFlags.GetProperty, null));
+                for (int i = 0; i < n; i++)
+                {
+                    object it = call(items, "Item", BindingFlags.InvokeMethod, new object[] { i });
+                    string path = call(it, "Path", BindingFlags.GetProperty, null) as string;
+                    if (!string.IsNullOrEmpty(path) && Directory.Exists(path) &&
+                        !list.Contains(path, StringComparer.OrdinalIgnoreCase)) list.Add(path);
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        void AddRoots()
+        {
+            tree.BeginUpdate();
+            // OneDrive (cá nhân và công ty), dùng biểu tượng đám mây của OneDrive như Explorer
+            try
+            {
+                string cloudKey = null;
+                using (var od = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\OneDrive"))
+                {
+                    string exe = od != null ? od.GetValue("OneDriveTrigger") as string : null;
+                    if (!string.IsNullOrEmpty(exe) && File.Exists(exe)) cloudKey = ShellIcons.Key(icons, exe, false, true);
+                }
+                using (var accounts = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\OneDrive\Accounts"))
+                    if (accounts != null)
+                        foreach (string name in accounts.GetSubKeyNames().OrderBy(x => x == "Personal" ? 0 : 1))
+                            using (var k = accounts.OpenSubKey(name))
+                            {
+                                string folder = k.GetValue("UserFolder") as string;
+                                if (string.IsNullOrEmpty(folder)) continue;
+                                string org = k.GetValue("DisplayName") as string;
+                                AddNode(tree.Nodes, name == "Personal" ? "OneDrive - Personal" : "OneDrive - " + (string.IsNullOrEmpty(org) ? Path.GetFileName(folder) : org), folder, true);
+                                if (cloudKey != null && tree.Nodes.Count > 0 && tree.Nodes[tree.Nodes.Count - 1].Tag as string == folder)
+                                    tree.Nodes[tree.Nodes.Count - 1].ImageKey = tree.Nodes[tree.Nodes.Count - 1].SelectedImageKey = cloudKey;
+                            }
+            }
+            catch { }
+            AddSeparator();
+
+            // Các thư mục quen thuộc + thư mục ghim trong Truy cập nhanh
+            var known = new[]
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                KnownFolder("374DE290-123F-4565-9164-39C4925E467B"),   // Downloads
+                Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyMusic),
+                Environment.GetFolderPath(Environment.SpecialFolder.MyVideos)
+            }.Where(p => !string.IsNullOrEmpty(p)).ToList();
+            foreach (string p in known.Concat(QuickAccessFolders().Where(q => !known.Contains(q, StringComparer.OrdinalIgnoreCase))))
+                AddNode(tree.Nodes, null, p, false);
+            AddSeparator();
+
+            // This PC và các ổ đĩa
+            string pcKey = ShellIcons.KeySpecial(icons, 0x11);
+            var pc = new TreeNode(ShellIcons.DisplayName(ThisPc) ?? "This PC") { ImageKey = pcKey, SelectedImageKey = pcKey };
+            tree.Nodes.Add(pc);
+            foreach (var d in DriveInfo.GetDrives())
+            {
+                try { if (d.IsReady) AddNode(pc.Nodes, null, d.RootDirectory.FullName, true); } catch { }
+            }
+            pc.Expand();
+            tree.EndUpdate();
+        }
+
+        void AddNode(TreeNodeCollection parent, string text, string path, bool expandable)
         {
             if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
             string key = ShellIcons.Key(icons, path, true, true);
-            var n = new TreeNode(text) { Tag = path, ImageKey = key, SelectedImageKey = key };
-            n.Nodes.Add(new TreeNode("..."));
-            tree.Nodes.Add(n);
+            var n = new TreeNode(text ?? ShellIcons.DisplayName(path) ?? Path.GetFileName(path.TrimEnd('\\'))) { Tag = path, ImageKey = key, SelectedImageKey = key };
+            if (expandable) n.Nodes.Add(new TreeNode("..."));
+            parent.Add(n);
+        }
+
+        // Tô sáng mục trên cây ứng với thư mục đang xem (nếu là mục gốc hoặc ổ đĩa)
+        void SelectInTree(string path)
+        {
+            TreeNode hit = null;
+            foreach (TreeNode n in tree.Nodes)
+            {
+                if (string.Equals(n.Tag as string, path, StringComparison.OrdinalIgnoreCase)) { hit = n; break; }
+                foreach (TreeNode c in n.Nodes)
+                    if (string.Equals(c.Tag as string, path, StringComparison.OrdinalIgnoreCase)) { hit = c; break; }
+                if (hit != null) break;
+            }
+            tree.SelectedNode = hit;
+        }
+
+        void AddSeparator()
+        {
+            tree.Nodes.Add(new TreeNode("") { Tag = Separator, ImageKey = "<none>", SelectedImageKey = "<none>" });
         }
 
         void Populate(TreeNode node)
         {
-            if (node.Nodes.Count != 1 || node.Nodes[0].Tag != null) return;
+            if (!(node.Tag is string) || node.Nodes.Count != 1 || node.Nodes[0].Tag != null) return;
             node.Nodes.Clear();
             string key = ShellIcons.Key(icons, "", true, false);
             foreach (var d in SubDirs((string)node.Tag))
@@ -1988,34 +2748,46 @@ namespace PdfTool
 
         void GoBack()
         {
-            if (history.Count > 0) Navigate(history.Pop(), false);
+            if (history.Count == 0) return;
+            forward.Push(current);
+            Navigate(history.Pop(), false);
+        }
+
+        void GoForward()
+        {
+            if (forward.Count == 0) return;
+            history.Push(current);
+            Navigate(forward.Pop(), false);
         }
 
         public void Navigate(string path, bool addHistory)
         {
             if (string.IsNullOrEmpty(path) || !Directory.Exists(path)) return;
             bool refresh = string.Equals(current, path, StringComparison.OrdinalIgnoreCase);
-            if (addHistory && current != null && !refresh) history.Push(current);
+            if (addHistory && current != null && !refresh) { history.Push(current); forward.Clear(); }
             var keep = refresh ? new HashSet<string>(Selection(), StringComparer.OrdinalIgnoreCase) : new HashSet<string>();
-            int top = refresh && list.TopItem != null ? list.TopItem.Index : 0;
+            int top = refresh ? list.TopIndex : 0;
             current = path;
             address.Text = path;
             list.BeginUpdate();
-            list.Items.Clear();
+            list.Clear();
             try
             {
                 var di = new DirectoryInfo(path);
                 string dirKey = ShellIcons.Key(icons, "", true, false);
-                foreach (var d in SubDirs(path))
-                    list.Items.Add(new ListViewItem(new[] { d.Name, d.LastWriteTime.ToString("dd/MM/yyyy HH:mm"), "" })
-                        { Tag = d.FullName, ImageKey = dirKey, Selected = keep.Contains(d.FullName) });
-                foreach (var f in di.GetFiles().Where(f => IsShown(f) && Supported(f.Name)).OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase))
-                    list.Items.Add(new ListViewItem(new[] { f.Name, f.LastWriteTime.ToString("dd/MM/yyyy HH:mm"), Job.SizeText(f.Length) })
-                        { Tag = f.FullName, ImageKey = ShellIcons.Key(icons, f.FullName, false, false), Selected = keep.Contains(f.FullName) });
+                foreach (var d in Sorted(SubDirs(path), true))
+                    list.Add(new[] { d.Name, d.LastWriteTime.ToString("dd/MM/yyyy HH:mm"), "" }, dirKey, d.FullName, keep.Contains(d.FullName));
+                foreach (var f in Sorted(di.GetFiles().Where(f => IsShown(f) && Supported(f.Name)), false))
+                    list.Add(new[] { f.Name, f.LastWriteTime.ToString("dd/MM/yyyy HH:mm"), Job.SizeText(f.Length) },
+                             ShellIcons.Key(icons, f.FullName, false, false), f.FullName, keep.Contains(f.FullName));
             }
-            catch (Exception ex) { list.Items.Add(new ListViewItem("(" + ex.Message + ")")); }
+            catch (Exception ex) { list.Add(new[] { "(" + ex.Message + ")", "", "" }, null, null, false); }
             list.EndUpdate();
-            if (refresh && top > 0 && top < list.Items.Count) list.TopItem = list.Items[top];
+            list.TopIndex = top;
+            SelectInTree(path);
+            btnBack.Enabled = history.Count > 0;
+            btnForward.Enabled = forward.Count > 0;
+            btnUp.Enabled = Directory.GetParent(path) != null;
             Watch(path);
             Settings.Set("browser", path);
         }
@@ -2245,7 +3017,7 @@ namespace PdfTool
     // ------------------------------------------------------------------
     // Vùng soạn: hiển thị tài liệu dạng ảnh thu nhỏ, kéo thả để sắp xếp
     // ------------------------------------------------------------------
-    class Workspace : Panel
+    class Workspace : Panel, IThemed
     {
         public readonly List<PdfDoc> Docs = new List<PdfDoc>();
         public readonly HashSet<PageRef> Selected = new HashSet<PageRef>();
@@ -2255,12 +3027,14 @@ namespace PdfTool
         public Action<PdfDoc> SaveRequested, CloseRequested;
         public Action<string[], PdfDoc, int> FilesDropped;     // doc null = tạo tài liệu mới
         public Action<PageRef> PreviewRequested;
+        public Action OpenRequested;
         public ContextMenuStrip PageMenu, DocMenu;
         int newCounter;
 
         readonly float scale;
         int box;
         int S(int v) { return (int)(v * scale); }
+        readonly FButton openBtn;
 
         class DocLayout
         {
@@ -2272,14 +3046,14 @@ namespace PdfTool
 
         Point downPt;
         bool dragArmed;
-        PageRef pendingSingle, anchor;
+        PageRef pendingSingle, anchor, hoverPage;
+        PdfDoc hoverDoc;
+        int hoverBtn;       // 1 = Lưu, 2 = Đóng
         bool dropActive;
         PdfDoc dropDoc;
         int dropIndex;
         const string PagesFormat = "PdfToolPages";
-
-        static readonly Color Bg = Color.FromArgb(43, 43, 43), BlockBg = Color.FromArgb(54, 54, 56), HeaderBg = Color.FromArgb(64, 64, 68),
-                              Accent = Color.FromArgb(0, 120, 212), TextC = Color.FromArgb(235, 235, 235), SubText = Color.FromArgb(165, 165, 165);
+        const TextFormatFlags Keep = TextFormatFlags.PreserveGraphicsTranslateTransform | TextFormatFlags.PreserveGraphicsClipping;
 
         public Workspace(float scale)
         {
@@ -2289,7 +3063,18 @@ namespace PdfTool
             AutoScroll = true;
             AllowDrop = true;
             TabStop = true;
-            BackColor = Bg;
+            BackColor = Theme.P.Canvas;
+            openBtn = new FButton("Mở tài liệu...", "", ButtonKind.Primary);
+            openBtn.Size = new Size(Math.Max(S(170), openBtn.GetPreferredSize(Size.Empty).Width), S(38));
+            openBtn.Click += (s, e) => { if (OpenRequested != null) OpenRequested(); };
+            Controls.Add(openBtn);
+        }
+
+        public void ApplyTheme()
+        {
+            BackColor = Theme.P.Canvas;
+            Theme.Native(this);
+            Invalidate();
         }
 
         void OnChanged()
@@ -2298,33 +3083,35 @@ namespace PdfTool
             if (h != null) h();
         }
 
-        int CellW { get { return box + S(26); } }
-        int CellH { get { return box + S(34); } }
+        int CellW { get { return box + S(28); } }
+        int CellH { get { return box + S(36); } }
 
         public void Relayout()
         {
             if (Active != null && !Docs.Contains(Active)) Active = Docs.FirstOrDefault();
             Selected.RemoveWhere(p => !Docs.Any(d => d.Pages.Contains(p)));
             layout.Clear();
-            int m = S(14), y = m;
-            int width = Math.Max(CellW + 2 * m + S(16), ClientSize.Width);
-            int cols = Math.Max(1, (width - 2 * m - S(16)) / CellW);
-            int hh = S(40);
+            int m = S(18), y = m;
+            int width = Math.Max(CellW + 2 * m + S(24), ClientSize.Width);
+            int cols = Math.Max(1, (width - 2 * m - S(24)) / CellW);
+            int hh = S(52);
             foreach (var d in Docs)
             {
                 var L = new DocLayout { Doc = d };
                 int rows = Math.Max(1, (d.Pages.Count + cols - 1) / cols);
-                L.Block = new Rectangle(m, y, width - 2 * m, hh + S(8) + rows * CellH + S(6));
+                L.Block = new Rectangle(m, y, width - 2 * m, hh + S(12) + rows * CellH + S(8));
                 L.Header = new Rectangle(m, y, width - 2 * m, hh);
-                int bh = S(26);
-                L.CloseBtn = new Rectangle(L.Header.Right - S(10) - S(30), y + (hh - bh) / 2, S(30), bh);
-                L.SaveBtn = new Rectangle(L.CloseBtn.Left - S(6) - S(64), y + (hh - bh) / 2, S(64), bh);
+                int bh = S(32);
+                L.CloseBtn = new Rectangle(L.Header.Right - S(12) - bh, y + (hh - bh) / 2, bh, bh);
+                L.SaveBtn = new Rectangle(L.CloseBtn.Left - S(6) - S(80), y + (hh - bh) / 2, S(80), bh);
                 for (int i = 0; i < d.Pages.Count; i++)
-                    L.Cells.Add(new Rectangle(m + S(8) + (i % cols) * CellW, y + hh + S(8) + (i / cols) * CellH, CellW, CellH));
+                    L.Cells.Add(new Rectangle(m + S(12) + (i % cols) * CellW, y + hh + S(12) + (i / cols) * CellH, CellW, CellH));
                 layout.Add(L);
                 y = L.Block.Bottom + m;
             }
-            AutoScrollMinSize = new Size(0, y);
+            AutoScrollMinSize = new Size(0, Docs.Count > 0 ? y : 0);
+            openBtn.Visible = Docs.Count == 0;
+            openBtn.Location = new Point((ClientSize.Width - openBtn.Width) / 2, ClientSize.Height / 2 + S(56));
             Invalidate();
         }
 
@@ -2335,24 +3122,17 @@ namespace PdfTool
         }
 
         // ---------------- vẽ ----------------
-        static GraphicsPath Round(Rectangle r, int rad)
+        static void DrawText(Graphics g, string s, Font f, Rectangle r, Color c, TextFormatFlags flags)
         {
-            var p = new GraphicsPath();
-            int d = Math.Max(1, rad * 2);
-            p.AddArc(r.X, r.Y, d, d, 180, 90);
-            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
-            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
-            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
-            p.CloseFigure();
-            return p;
+            TextRenderer.DrawText(g, s, f, r, c, flags | Keep);
         }
 
         protected override void OnPaint(PaintEventArgs e)
         {
+            var p = Theme.P;
             var g = e.Graphics;
-            g.Clear(Bg);
+            g.Clear(p.Canvas);
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
             g.InterpolationMode = InterpolationMode.HighQualityBicubic;
 
             if (Docs.Count == 0) { DrawEmpty(g); if (dropActive) DrawNewDocTarget(g); return; }
@@ -2361,48 +3141,23 @@ namespace PdfTool
             g.TranslateTransform(AutoScrollPosition.X, AutoScrollPosition.Y);
             var clip = e.ClipRectangle;
             clip.Offset(-AutoScrollPosition.X, -AutoScrollPosition.Y);
+            foreach (var L in layout)
+                if (L.Block.IntersectsWith(clip)) DrawDoc(g, L, clip);
 
-            using (var titleFont = new Font("Segoe UI Semibold", 10.5f))
-            using (var small = new Font("Segoe UI", 8.5f))
-            using (var sfC = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            using (var sfL = new StringFormat { LineAlignment = StringAlignment.Center, Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap })
+            // Vị trí thả
+            if (dropActive && dropDoc != null)
             {
-                foreach (var L in layout)
+                var L = layout.FirstOrDefault(x => x.Doc == dropDoc);
+                if (L != null && L.Cells.Count > 0)
                 {
-                    if (!L.Block.IntersectsWith(clip)) continue;
-                    var d = L.Doc;
-                    bool active = d == Active;
-                    using (var path = Round(L.Block, S(6)))
-                    using (var b = new SolidBrush(BlockBg)) g.FillPath(b, path);
-                    using (var path = Round(L.Header, S(6)))
-                    using (var b = new SolidBrush(active ? Color.FromArgb(72, 72, 78) : HeaderBg)) g.FillPath(b, path);
-                    if (active) using (var b = new SolidBrush(Accent)) g.FillRectangle(b, L.Header.X, L.Header.Y + S(8), S(4), L.Header.Height - S(16));
-
-                    var titleRect = new RectangleF(L.Header.X + S(14), L.Header.Y, L.SaveBtn.Left - L.Header.X - S(24), L.Header.Height);
-                    string title = d.Name + (d.Modified ? " *" : "");
-                    string sub = "   " + d.Pages.Count + " trang";
-                    using (var tb = new SolidBrush(TextC)) g.DrawString(title, titleFont, tb, titleRect, sfL);
-                    var tsz = g.MeasureString(title, titleFont);
-                    if (tsz.Width + S(80) < titleRect.Width)
-                        using (var sb = new SolidBrush(SubText))
-                            g.DrawString(sub, small, sb, new RectangleF(titleRect.X + tsz.Width, titleRect.Y, S(120), titleRect.Height), sfL);
-
-                    DrawButton(g, L.SaveBtn, "Lưu", small, sfC, d.Modified);
-                    DrawButton(g, L.CloseBtn, "✕", small, sfC, false);
-
-                    for (int i = 0; i < d.Pages.Count; i++)
-                        if (L.Cells[i].IntersectsWith(clip)) DrawPage(g, d.Pages[i], L.Cells[i], i + 1, small, sfC);
-                }
-
-                // Vị trí thả
-                if (dropActive && dropDoc != null)
-                {
-                    var L = layout.FirstOrDefault(x => x.Doc == dropDoc);
-                    if (L != null && L.Cells.Count > 0)
+                    Rectangle c = dropIndex < L.Cells.Count ? L.Cells[dropIndex] : L.Cells[L.Cells.Count - 1];
+                    int x = dropIndex < L.Cells.Count ? c.Left : c.Right;
+                    int y0 = c.Top + S(4), y1 = c.Top + S(10) + box;
+                    using (var pen = new Pen(p.Accent, S(3)) { StartCap = LineCap.Round, EndCap = LineCap.Round }) g.DrawLine(pen, x, y0, x, y1);
+                    using (var b = new SolidBrush(p.Accent))
                     {
-                        Rectangle c = dropIndex < L.Cells.Count ? L.Cells[dropIndex] : L.Cells[L.Cells.Count - 1];
-                        int x = dropIndex < L.Cells.Count ? c.Left : c.Right;
-                        using (var pen = new Pen(Accent, S(4))) g.DrawLine(pen, x, c.Top + S(2), x, c.Top + S(8) + box);
+                        g.FillEllipse(b, x - S(5), y0 - S(5), S(10), S(10));
+                        g.FillEllipse(b, x - S(5), y1 - S(5), S(10), S(10));
                     }
                 }
             }
@@ -2410,78 +3165,129 @@ namespace PdfTool
             if (dropActive && dropDoc == null) DrawNewDocTarget(g);
         }
 
-        void DrawButton(Graphics g, Rectangle r, string text, Font f, StringFormat sf, bool highlight)
+        void DrawDoc(Graphics g, DocLayout L, Rectangle clip)
         {
-            using (var path = Round(r, S(4)))
-            {
-                using (var b = new SolidBrush(highlight ? Accent : Color.FromArgb(90, 90, 96))) g.FillPath(b, path);
-                g.DrawString(text, f, Brushes.White, r, sf);
-            }
+            var p = Theme.P;
+            var d = L.Doc;
+            bool active = d == Active;
+            Theme.FillRound(g, new RectangleF(L.Block.X + 0.5f, L.Block.Y + 0.5f, L.Block.Width - 1, L.Block.Height - 1), S(10),
+                            p.Surface, active ? p.Accent : p.Border, active ? S(2) : 1);
+
+            var h = L.Header;
+            var ic = new Rectangle(h.X + S(16), h.Y + (h.Height - S(30)) / 2, S(30), S(30));
+            Theme.Glyph(g, "", ic, p.AccentText, 16f, false);
+            int x = ic.Right + S(10);
+            var tf = Theme.UiSemi(11f);
+            int maxTitle = Math.Max(S(60), L.SaveBtn.Left - x - S(200));
+            int tw = Math.Min(TextRenderer.MeasureText(g, d.Name, tf, Size.Empty, TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix).Width + S(2), maxTitle);
+            DrawText(g, d.Name, tf, new Rectangle(x, h.Y, tw, h.Height), p.Text, Theme.TextLeft);
+            x += tw + S(12);
+            x = Chip(g, x, h, d.Pages.Count + " trang", p.TextMuted, Color.FromArgb(p.Dark ? 34 : 14, p.Text)) + S(6);
+            if (d.Modified) Chip(g, x, h, "Chưa lưu", p.Warning, p.WarningBg);
+
+            HeaderButton(g, L.SaveBtn, "", "Lưu", d.Modified, hoverDoc == d && hoverBtn == 1);
+            HeaderButton(g, L.CloseBtn, "", null, false, hoverDoc == d && hoverBtn == 2);
+            using (var pen = new Pen(p.Divider)) g.DrawLine(pen, L.Block.X + 1, h.Bottom, L.Block.Right - 2, h.Bottom);
+
+            for (int i = 0; i < d.Pages.Count; i++)
+                if (L.Cells[i].IntersectsWith(clip)) DrawPage(g, d.Pages[i], L.Cells[i], i + 1);
         }
 
-        void DrawPage(Graphics g, PageRef p, Rectangle cell, int number, Font f, StringFormat sf)
+        int Chip(Graphics g, int x, Rectangle h, string text, Color fg, Color bg)
         {
-            bool sel = Selected.Contains(p);
-            if (sel)
-            {
-                var r0 = Rectangle.Inflate(cell, -S(3), -S(2));
-                using (var path = Round(r0, S(5)))
-                {
-                    using (var b = new SolidBrush(Color.FromArgb(80, 0, 120, 212))) g.FillPath(b, path);
-                    using (var pen = new Pen(Accent, S(2))) g.DrawPath(pen, path);
-                }
-            }
-            Bitmap bmp = Session.Thumb(p);
+            var f = Theme.Ui(8.5f);
+            int tw = TextRenderer.MeasureText(g, text, f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            var r = new Rectangle(x, h.Y + (h.Height - S(22)) / 2, tw + S(18), S(22));
+            Theme.FillRound(g, r, S(11), bg, Color.Empty, 0);
+            DrawText(g, text, f, r, fg, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix);
+            return r.Right;
+        }
+
+        void HeaderButton(Graphics g, Rectangle r, string glyph, string text, bool primary, bool hot)
+        {
+            var p = Theme.P;
+            Color fill = primary ? (hot ? p.AccentHover : p.Accent) : (hot ? (text != null ? p.ButtonHover : p.Hover) : (text != null ? p.ButtonBg : Color.Empty));
+            Color border = !primary && text != null ? p.ButtonBorder : Color.Empty;
+            Color fg = primary ? p.OnAccent : p.Text;
+            Theme.FillRound(g, new RectangleF(r.X + 0.5f, r.Y + 0.5f, r.Width - 1, r.Height - 1), S(4), fill, border, 1);
+            if (text == null) { Theme.Glyph(g, glyph, r, fg, 10f, false); return; }
+            var f = Theme.Ui(9.5f);
+            int tw = TextRenderer.MeasureText(g, text, f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            int x = r.X + (r.Width - (S(16) + S(6) + tw)) / 2;
+            Theme.Glyph(g, glyph, new RectangleF(x, r.Y, S(16), r.Height), fg, 10f, false);
+            DrawText(g, text, f, new Rectangle(x + S(22), r.Y, tw + S(2), r.Height), fg, Theme.TextLeft);
+        }
+
+        void DrawPage(Graphics g, PageRef pg, Rectangle cell, int number)
+        {
+            var p = Theme.P;
+            bool sel = Selected.Contains(pg), hot = pg == hoverPage;
+            var r0 = Rectangle.Inflate(cell, -S(4), -S(2));
+            if (sel) Theme.FillRound(g, new RectangleF(r0.X + 1, r0.Y + 1, r0.Width - 2, r0.Height - 2), S(8), p.Selection, p.Accent, S(2));
+            else if (hot) Theme.FillRound(g, r0, S(8), p.Hover, Color.Empty, 0);
+
+            Bitmap bmp = Session.Thumb(pg);
             double w = bmp != null ? bmp.Width : 210, h = bmp != null ? bmp.Height : 297;
-            bool swap = p.Rot % 180 != 0;
+            bool swap = pg.Rot % 180 != 0;
             double vw = swap ? h : w, vh = swap ? w : h;
             double s = Math.Min(box / vw, box / vh);
             int dw = Math.Max(4, (int)(vw * s)), dh = Math.Max(4, (int)(vh * s));
-            var r = new Rectangle(cell.X + (cell.Width - dw) / 2, cell.Y + S(8) + (box - dh) / 2, dw, dh);
-            using (var shadow = new SolidBrush(Color.FromArgb(90, 0, 0, 0))) g.FillRectangle(shadow, r.X + S(2), r.Y + S(3), r.Width, r.Height);
+            var r = new Rectangle(cell.X + (cell.Width - dw) / 2, cell.Y + S(10) + (box - dh) / 2, dw, dh);
+            // Bóng đổ mềm dưới trang
+            var mode = g.SmoothingMode;
+            g.SmoothingMode = SmoothingMode.None;
+            for (int k = 3; k >= 1; k--)
+                using (var b = new SolidBrush(Color.FromArgb(p.Dark ? 70 / k : 30 / k, 0, 0, 0)))
+                    g.FillRectangle(b, r.X - k + 1, r.Y - k + S(2), r.Width + 2 * k - 2, r.Height + 2 * k - 2);
             g.FillRectangle(Brushes.White, r);
             if (bmp != null)
             {
                 var st = g.Save();
                 g.TranslateTransform(r.X + r.Width / 2f, r.Y + r.Height / 2f);
-                g.RotateTransform(p.Rot);
+                g.RotateTransform(pg.Rot);
                 float uw = swap ? r.Height : r.Width, uh = swap ? r.Width : r.Height;
                 g.DrawImage(bmp, -uw / 2, -uh / 2, uw, uh);
                 g.Restore(st);
             }
-            else g.DrawString("...", f, Brushes.Gray, r, sf);
-            using (var b = new SolidBrush(sel ? Color.White : SubText))
-                g.DrawString(number.ToString(), f, b, new Rectangle(cell.X, cell.Y + S(8) + box + S(2), cell.Width, S(20)), sf);
+            else Theme.Glyph(g, "", r, Color.FromArgb(255, 0xC8, 0xC8, 0xC8), 18f, false);
+            if (!p.Dark) using (var pen = new Pen(Color.FromArgb(30, 0, 0, 0))) g.DrawRectangle(pen, r.X, r.Y, r.Width - 1, r.Height - 1);
+            g.SmoothingMode = mode;
+            DrawText(g, number.ToString(), sel ? Theme.UiSemi(9f) : Theme.Ui(9f), new Rectangle(cell.X, cell.Y + S(12) + box, cell.Width, S(20)),
+                 sel ? p.AccentText : p.TextMuted, TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
         void DrawEmpty(Graphics g)
         {
-            var r = Rectangle.Inflate(ClientRectangle, -S(40), -S(40));
+            var p = Theme.P;
+            var r = Rectangle.Inflate(ClientRectangle, -S(28), -S(28));
             if (r.Width < 50 || r.Height < 50) return;
-            using (var pen = new Pen(Color.FromArgb(90, 90, 90), S(2)) { DashStyle = DashStyle.Dash })
-            using (var path = Round(r, S(12))) g.DrawPath(pen, path);
-            using (var big = new Font("Segoe UI Semibold", 15f))
-            using (var small = new Font("Segoe UI", 10f))
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-            using (var b1 = new SolidBrush(TextC))
-            using (var b2 = new SolidBrush(SubText))
-            {
-                int cy = r.Y + r.Height / 2;
-                g.DrawString("Kéo thả tài liệu PDF hoặc ảnh vào đây để chỉnh sửa", big, b1, new Rectangle(r.X, cy - S(40), r.Width, S(40)), sf);
-                g.DrawString("hoặc nhấn đúp vào file ở danh sách bên trái, hoặc bấm \"Mở...\"", small, b2, new Rectangle(r.X, cy + S(4), r.Width, S(30)), sf);
-            }
+            using (var pen = new Pen(p.Dark ? Color.FromArgb(255, 0x44, 0x44, 0x44) : Color.FromArgb(255, 0xC6, 0xC9, 0xCE), 1.5f) { DashStyle = DashStyle.Dash })
+            using (var path = Theme.Round(r, S(14))) g.DrawPath(pen, path);
+            int cx = ClientSize.Width / 2, cy = ClientSize.Height / 2;
+            var circle = new RectangleF(cx - S(44), cy - S(128), S(88), S(88));
+            using (var b = new SolidBrush(Color.FromArgb(p.Dark ? 40 : 24, p.Accent))) g.FillEllipse(b, circle);
+            Theme.Glyph(g, "", circle, p.AccentText, 30f, false);
+            TextRenderer.DrawText(g, "Kéo thả tài liệu PDF hoặc ảnh vào đây", Theme.UiSemi(15f), new Rectangle(0, cy - S(28), ClientSize.Width, S(34)), p.Text,
+                                  TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
+            TextRenderer.DrawText(g, "từ danh sách bên trái hoặc từ File Explorer. Hỗ trợ PDF, JPG, PNG, BMP, GIF, TIFF.", Theme.Ui(10f),
+                                  new Rectangle(0, cy + S(8), ClientSize.Width, S(26)), p.TextMuted,
+                                  TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix);
         }
 
         void DrawNewDocTarget(Graphics g)
         {
-            var r = Rectangle.Inflate(ClientRectangle, -S(4), -S(4));
-            using (var pen = new Pen(Accent, S(3)) { DashStyle = DashStyle.Dash }) g.DrawRectangle(pen, r);
-            var lbl = new Rectangle(r.X + r.Width / 2 - S(130), r.Bottom - S(44), S(260), S(32));
-            using (var path = Round(lbl, S(6)))
-            using (var b = new SolidBrush(Accent)) g.FillPath(b, path);
-            using (var f = new Font("Segoe UI", 9.5f))
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
-                g.DrawString("Thả để tạo tài liệu mới", f, Brushes.White, lbl, sf);
+            var p = Theme.P;
+            using (var b = new SolidBrush(Color.FromArgb(p.Dark ? 26 : 16, p.Accent))) g.FillRectangle(b, ClientRectangle);
+            var r = Rectangle.Inflate(ClientRectangle, -S(10), -S(10));
+            using (var pen = new Pen(p.Accent, S(2)) { DashStyle = DashStyle.Dash })
+            using (var path = Theme.Round(r, S(12))) g.DrawPath(pen, path);
+            var f = Theme.UiSemi(10f);
+            string text = "Thả để tạo tài liệu mới";
+            int tw = TextRenderer.MeasureText(g, text, f, Size.Empty, TextFormatFlags.NoPadding).Width;
+            var lbl = new Rectangle(r.X + r.Width / 2 - (tw + S(56)) / 2, r.Bottom - S(58), tw + S(56), S(38));
+            Theme.FillRound(g, lbl, S(19), p.Accent, Color.Empty, 0);
+            Theme.Glyph(g, "", new RectangleF(lbl.X + S(16), lbl.Y, S(16), lbl.Height), p.OnAccent, 10f, false);
+            TextRenderer.DrawText(g, text, f, new Rectangle(lbl.X + S(40), lbl.Y, tw + S(4), lbl.Height), p.OnAccent, Theme.TextLeft);
         }
 
         // ---------------- chuột ----------------
@@ -2576,6 +3382,7 @@ namespace PdfTool
         protected override void OnMouseMove(MouseEventArgs e)
         {
             base.OnMouseMove(e);
+            if (e.Button == MouseButtons.None) { UpdateHover(e.Location); return; }
             if (!dragArmed || e.Button != MouseButtons.Left) return;
             var ds = SystemInformation.DragSize;
             if (Math.Abs(e.X - downPt.X) < ds.Width && Math.Abs(e.Y - downPt.Y) < ds.Height) return;
@@ -2583,6 +3390,37 @@ namespace PdfTool
             pendingSingle = null;
             DoDragDrop(new DataObject(PagesFormat, "pages"), DragDropEffects.Move | DragDropEffects.Copy);
             dropActive = false;
+            Invalidate();
+        }
+
+        // Tô sáng trang và nút dưới con trỏ chuột
+        void UpdateHover(Point client)
+        {
+            Point p = ToContent(client);
+            var L = DocAt(p);
+            PageRef page = null;
+            int btn = 0;
+            if (L != null)
+            {
+                int i = PageAt(L, p);
+                if (i >= 0) page = L.Doc.Pages[i];
+                btn = L.SaveBtn.Contains(p) ? 1 : L.CloseBtn.Contains(p) ? 2 : 0;
+            }
+            PdfDoc doc = L != null ? L.Doc : null;
+            if (page == hoverPage && btn == hoverBtn && (btn == 0 || doc == hoverDoc)) return;
+            hoverPage = page;
+            hoverBtn = btn;
+            hoverDoc = doc;
+            Cursor = btn != 0 ? Cursors.Hand : Cursors.Default;
+            Invalidate();
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            base.OnMouseLeave(e);
+            if (hoverPage == null && hoverBtn == 0) return;
+            hoverPage = null;
+            hoverBtn = 0;
             Invalidate();
         }
 
@@ -2802,31 +3640,40 @@ namespace PdfTool
         int index;
         readonly PictureBox pic;
         readonly Label lbl;
+        readonly FButton prev, next;
 
         public PreviewForm(Session session, List<PageRef> pages, int index, string title)
         {
             this.session = session;
             this.pages = pages;
             this.index = index;
-            float s;
-            using (var g = CreateGraphics()) s = g.DpiX / 96f;
+            Func<int, int> S = Theme.S;
             Text = "Xem trước - " + title;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.Ui(10f);
             var wa = Screen.FromPoint(Cursor.Position).WorkingArea;
             Size = new Size(Math.Min(wa.Width, (int)(wa.Height * 0.8)), (int)(wa.Height * 0.9));
             StartPosition = FormStartPosition.CenterParent;
             KeyPreview = true;
             ShowInTaskbar = false;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
-            pic = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BackColor = Color.FromArgb(50, 50, 50) };
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding((int)(4 * s)) };
-            var prev = new Button { Text = "◀ Trang trước", AutoSize = true };
-            var next = new Button { Text = "Trang sau ▶", AutoSize = true };
-            lbl = new Label { AutoSize = true, Margin = new Padding((int)(10 * s), (int)(8 * s), 0, 0) };
+            pic = new PictureBox { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, Padding = new Padding(S(16)) };
+            Theme.Bg(pic, Role.Canvas);
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = S(54), WrapContents = false, Padding = new Padding(S(12), S(10), S(12), S(8)) };
+            Theme.Bg(bar, Role.Surface);
+            prev = new FButton("Trang trước", "\uE72B", ButtonKind.Standard);
+            next = new FButton("Trang sau", "\uE72A", ButtonKind.Standard);
+            prev.Margin = next.Margin = new Padding(0, 0, S(8), 0);
+            lbl = new Label { AutoSize = true, Font = Theme.UiSemi(10.5f), Margin = new Padding(S(10), S(8), 0, 0) };
             prev.Click += (o, e) => Go(-1);
             next.Click += (o, e) => Go(1);
+            Theme.Tip(prev, "Trang trước (← hoặc Page Up)");
+            Theme.Tip(next, "Trang sau (→ hoặc Page Down)");
             bar.Controls.AddRange(new Control[] { prev, next, lbl });
+            var line = new Panel { Dock = DockStyle.Top, Height = 1 };
+            Theme.Bg(line, Role.Divider);
             Controls.Add(pic);
+            Controls.Add(line);
             Controls.Add(bar);
             KeyDown += (o, e) =>
             {
@@ -2834,6 +3681,7 @@ namespace PdfTool
                 else if (e.KeyCode == Keys.Right || e.KeyCode == Keys.PageDown) Go(1);
                 else if (e.KeyCode == Keys.Escape) Close();
             };
+            Theme.Apply(this);
             Shown += (o, e) => ShowPage();
             FormClosed += (o, e) => { if (pic.Image != null) pic.Image.Dispose(); };
         }
@@ -2849,6 +3697,8 @@ namespace PdfTool
         void ShowPage()
         {
             lbl.Text = "Trang " + (index + 1) + " / " + pages.Count;
+            prev.Enabled = index > 0;
+            next.Enabled = index < pages.Count - 1;
             Cursor = Cursors.WaitCursor;
             try
             {
@@ -2858,6 +3708,94 @@ namespace PdfTool
             }
             catch (Exception ex) { lbl.Text += "   (" + ex.Message + ")"; }
             finally { Cursor = Cursors.Default; }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Ô "Ủng hộ cốc cafe" ở góc dưới bên trái (mã QR chuyển khoản)
+    // ------------------------------------------------------------------
+    class DonatePanel : Panel, IThemed
+    {
+        static Image card;   // ảnh thẻ VietQR nhúng trong exe (donate.png)
+        readonly Bitmap qr;
+        bool hover;
+
+        static Image Card
+        {
+            get
+            {
+                if (card == null)
+                    using (var s = typeof(DonatePanel).Assembly.GetManifestResourceStream("PdfTool.donate.png"))
+                        if (s != null) card = new Bitmap(Image.FromStream(s));
+                return card;
+            }
+        }
+
+        static int S(int v) { return Theme.S(v); }
+
+        public DonatePanel(float scale)
+        {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
+            BackColor = Color.Transparent;
+            Dock = DockStyle.Bottom;
+            Height = S(86);
+            Cursor = Cursors.Hand;
+            if (Card == null) { Visible = false; return; }
+
+            // Cắt phần mã QR từ ảnh thẻ để hiển thị nhỏ
+            qr = new Bitmap(S(52), S(52));
+            using (var g = Graphics.FromImage(qr))
+            {
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.Clear(Color.White);
+                g.DrawImage(Card, new Rectangle(0, 0, qr.Width, qr.Height), new Rectangle(190, 220, 595, 595), GraphicsUnit.Pixel);
+            }
+            Theme.Tip(this, "Nhấn để phóng to mã QR, quét bằng ứng dụng ngân hàng để ủng hộ tác giả");
+        }
+
+        public void ApplyTheme() { Invalidate(); }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnClick(EventArgs e) { base.OnClick(e); ShowCard(); }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            if (qr == null) return;
+            var g = e.Graphics;
+            var p = Theme.P;
+            var r = new RectangleF(S(4) + 0.5f, S(8) + 0.5f, Width - S(8) - 1, Height - S(14) - 1);
+            Color bg = hover ? (p.Dark ? Color.FromArgb(255, 0x3E, 0x32, 0x22) : Color.FromArgb(255, 0xFF, 0xF1, 0xD6)) : p.DonateBg;
+            Theme.FillRound(g, r, S(8), bg, p.DonateBorder, 1);
+            var q = new RectangleF(r.X + S(8), r.Y + (r.Height - S(56)) / 2, S(56), S(56));
+            Theme.FillRound(g, q, S(4), Color.White, Color.Empty, 0);
+            g.InterpolationMode = InterpolationMode.NearestNeighbor;
+            g.DrawImage(qr, q.X + S(2), q.Y + S(2), S(52), S(52));
+            int x = (int)q.Right + S(10), y = (int)r.Y + S(5), w = (int)r.Right - x - S(4);
+            TextRenderer.DrawText(g, "☕ Ủng hộ cốc cafe", Theme.UiSemi(9.5f), new Rectangle(x, y, w, S(19)), p.DonateTitle, Theme.TextLeft);
+            TextRenderer.DrawText(g, "BIDV · 4260301070", Theme.Ui(8.5f), new Rectangle(x, y + S(19), w, S(16)), p.Text, Theme.TextLeft);
+            TextRenderer.DrawText(g, "NGO QUANG HUY", Theme.Ui(8.5f), new Rectangle(x, y + S(34), w, S(16)), p.TextMuted, Theme.TextLeft);
+            TextRenderer.DrawText(g, "Nhấn để phóng to mã QR", Theme.Ui(8f), new Rectangle(x, y + S(49), w, S(15)), p.TextMuted, Theme.TextLeft);
+        }
+
+        void ShowCard()
+        {
+            using (var f = new Form
+            {
+                Text = "Ủng hộ cốc cafe", FormBorderStyle = FormBorderStyle.FixedDialog, MinimizeBox = false, MaximizeBox = false,
+                StartPosition = FormStartPosition.CenterParent, ShowInTaskbar = false,
+                ClientSize = new Size(S(400), S(497)), Padding = new Padding(S(12))
+            })
+            {
+                var pic = new PictureBox { Image = Card, Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom };
+                Theme.Bg(pic, Role.Window);
+                f.Controls.Add(pic);
+                f.KeyPreview = true;
+                f.KeyDown += (o, e) => { if (e.KeyCode == Keys.Escape) f.Close(); };
+                Theme.Apply(f);
+                f.ShowDialog(FindForm());
+            }
         }
     }
 
@@ -2872,86 +3810,123 @@ namespace PdfTool
         readonly FileBrowser browser;
         readonly Workspace ws;
         readonly SplitContainer split;
-        readonly ToolStripStatusLabel status;
-        readonly StatusStrip statusStrip;
-        readonly List<ToolStripItem> needSelection = new List<ToolStripItem>(), needDoc = new List<ToolStripItem>();
-        ToolStripItem bMerge, bCloseAll;
+        readonly FlowLayoutPanel bar;
+        readonly Panel statusBar;
+        readonly Label status;
+        readonly List<FButton> needSelection = new List<FButton>(), needDoc = new List<FButton>();
+        FButton bMerge, bCloseAll;
         public Action<string> SendToToolbox;
 
         public CreatorView(float scale)
         {
             this.scale = scale;
-            Font = new Font("Segoe UI", 9f);
+            Font = Theme.Ui(10f);
+            Theme.Bg(this, Role.Window);
 
             split = new SplitContainer { Dock = DockStyle.Fill, FixedPanel = FixedPanel.Panel1, SplitterWidth = S(5) };
+            Theme.Bg(split, Role.Surface);
+            Theme.Bg(split.Panel1, Role.Surface);
+            Theme.Bg(split.Panel2, Role.Canvas);
+            split.Paint += (o, e) =>
+            {
+                var r = split.SplitterRectangle;
+                using (var pen = new Pen(Theme.P.Border)) e.Graphics.DrawLine(pen, r.Right - 1, r.Y, r.Right - 1, r.Bottom);
+            };
             browser = new FileBrowser(scale) { Dock = DockStyle.Fill };
             browser.OpenFiles = files => OpenFiles(files, null, -1);
+            var donate = new DonatePanel(scale) { Padding = new Padding(0) };
+            var donateHost = new Panel { Dock = DockStyle.Bottom, Height = donate.Height, Padding = new Padding(S(4), 0, S(4), 0) };
+            Theme.Bg(donateHost, Role.Surface);
+            donate.Dock = DockStyle.Fill;
+            donateHost.Controls.Add(donate);
             split.Panel1.Controls.Add(browser);
+            split.Panel1.Controls.Add(donateHost);
 
             ws = new Workspace(scale) { Dock = DockStyle.Fill, Session = session };
             ws.SaveRequested = d => SaveDoc(d);
             ws.CloseRequested = d => CloseDoc(d);
             ws.FilesDropped = (f, d, i) => OpenFiles(f, d, i);
             ws.PreviewRequested = Preview;
+            ws.OpenRequested = OpenDialog;
             ws.Changed += UpdateUi;
             session.ThumbsChanged = () =>
             {
                 try { if (ws.IsHandleCreated) ws.BeginInvoke(new Action(ws.Invalidate)); } catch { }
             };
 
-            var bar = new ToolStrip { GripStyle = ToolStripGripStyle.Hidden, Padding = new Padding(S(4), S(2), S(4), S(2)), ImageScalingSize = new Size(S(16), S(16)) };
-            Func<string, string, Action, ToolStripButton> add = (text, tip, act) =>
+            // Thanh công cụ
+            bar = new FlowLayoutPanel { Dock = DockStyle.Top, Height = S(54), WrapContents = false, Padding = new Padding(S(10), S(10), S(10), S(8)) };
+            Theme.Bg(bar, Role.Surface);
+            bar.Paint += (o, e) => { using (var pen = new Pen(Theme.P.Divider)) e.Graphics.DrawLine(pen, 0, bar.Height - 1, bar.Width, bar.Height - 1); };
+            Func<string, string, string, Action, FButton> add = (text, glyph, tip, act) =>
             {
-                var b = new ToolStripButton(text) { ToolTipText = tip, DisplayStyle = ToolStripItemDisplayStyle.Text, Padding = new Padding(S(3), S(2), S(3), S(2)) };
+                var b = new FButton(text, glyph, ButtonKind.Subtle) { Compactable = text != null, Margin = new Padding(0, 0, S(2), 0) };
                 b.Click += (o, e) => act();
-                bar.Items.Add(b);
+                Theme.Tip(b, tip);
+                bar.Controls.Add(b);
                 return b;
             };
-            add("Mở...", "Mở file PDF hoặc ảnh (Ctrl+O)", OpenDialog);
-            needDoc.Add(add("Lưu", "Lưu tài liệu đang chọn (Ctrl+S)", () => SaveDoc(ws.Active)));
-            bar.Items.Add(new ToolStripSeparator());
-            bMerge = add("Gộp tất cả", "Gộp tất cả tài liệu thành một", ws.MergeAll);
-            needSelection.Add(add("Tách trang chọn", "Chuyển các trang đang chọn thành tài liệu mới", ws.ExtractSelected));
-            bar.Items.Add(new ToolStripSeparator());
-            needSelection.Add(add("↺ Xoay trái", "Xoay trang đang chọn 90° ngược chiều kim đồng hồ", () => ws.RotateSelected(270)));
-            needSelection.Add(add("↻ Xoay phải", "Xoay trang đang chọn 90° theo chiều kim đồng hồ", () => ws.RotateSelected(90)));
-            needSelection.Add(add("Xóa trang", "Xóa các trang đang chọn (Delete)", ws.DeleteSelected));
-            needSelection.Add(add("Xem trước", "Xem trang đang chọn cỡ lớn (Enter / nhấn đúp)", () => { var s = ws.OrderedSelection(); if (s.Count > 0) Preview(s[0]); }));
-            bar.Items.Add(new ToolStripSeparator());
-            add("＋", "Phóng to ảnh trang (Ctrl + lăn chuột)", () => ws.Zoom(S(30)));
-            add("－", "Thu nhỏ ảnh trang (Ctrl + lăn chuột)", () => ws.Zoom(-S(30)));
-            bar.Items.Add(new ToolStripSeparator());
-            needDoc.Add(add("Nén / OCR / khác...", "Mở tài liệu đang chọn trong Hộp công cụ (nén, OCR, đánh số trang, mật khẩu...)", SendActiveToToolbox));
-            needDoc.Add(add("Đóng", "Đóng tài liệu đang chọn", () => CloseDoc(ws.Active)));
-            bCloseAll = add("Đóng tất cả", "Đóng tất cả tài liệu", CloseAll);
+            add("Mở", "\uE838", "Mở file PDF hoặc ảnh (Ctrl+O)", OpenDialog);
+            needDoc.Add(add("Lưu", "\uE74E", "Lưu tài liệu đang chọn (Ctrl+S)", () => SaveDoc(ws.Active)));
+            bar.Controls.Add(new Separator());
+            bMerge = add("Gộp tất cả", "\uEA3C", "Gộp tất cả tài liệu thành một", ws.MergeAll);
+            needSelection.Add(add("Tách trang", "\uE8C6", "Chuyển các trang đang chọn thành tài liệu mới", ws.ExtractSelected));
+            bar.Controls.Add(new Separator());
+            var rotL = add(null, "\uE7AD", "Xoay trái 90° các trang đang chọn", () => ws.RotateSelected(270));
+            rotL.MirrorGlyph = true;
+            needSelection.Add(rotL);
+            needSelection.Add(add(null, "\uE7AD", "Xoay phải 90° các trang đang chọn", () => ws.RotateSelected(90)));
+            needSelection.Add(add("Xóa", "\uE74D", "Xóa các trang đang chọn (Delete)", ws.DeleteSelected));
+            needSelection.Add(add("Xem", "\uE890", "Xem trang đang chọn cỡ lớn (Enter hoặc nhấn đúp)", PreviewSelected));
+            bar.Controls.Add(new Separator());
+            add(null, "\uE71F", "Thu nhỏ ảnh trang (Ctrl + lăn chuột)", () => ws.Zoom(-S(30)));
+            add(null, "\uE8A3", "Phóng to ảnh trang (Ctrl + lăn chuột)", () => ws.Zoom(S(30)));
+            bar.Controls.Add(new Separator());
+            needDoc.Add(add("Nén, OCR, mật khẩu...", "\uE90F", "Mở tài liệu đang chọn trong Hộp công cụ (nén, OCR, đánh số trang, mật khẩu...)", SendActiveToToolbox));
+            bCloseAll = add("Đóng tất cả", "\uE711", "Đóng tất cả tài liệu", CloseAll);
+            bar.Resize += (o, e) => FitToolbar();
 
-            ws.PageMenu = new ContextMenuStrip();
-            ws.PageMenu.Items.Add("Xem trước", null, (o, e) => { var s = ws.OrderedSelection(); if (s.Count > 0) Preview(s[0]); });
-            ws.PageMenu.Items.Add("Xoay trái", null, (o, e) => ws.RotateSelected(270));
-            ws.PageMenu.Items.Add("Xoay phải", null, (o, e) => ws.RotateSelected(90));
-            ws.PageMenu.Items.Add("Tách thành tài liệu mới", null, (o, e) => ws.ExtractSelected());
-            ws.PageMenu.Items.Add("Xóa", null, (o, e) => ws.DeleteSelected());
-            ws.DocMenu = new ContextMenuStrip();
-            ws.DocMenu.Items.Add("Lưu...", null, (o, e) => SaveDoc(ws.Active));
-            ws.DocMenu.Items.Add("Đổi tên...", null, (o, e) => RenameActive());
-            ws.DocMenu.Items.Add("Chọn tất cả trang", null, (o, e) => ws.SelectAll());
-            ws.DocMenu.Items.Add("Mở trong Hộp công cụ...", null, (o, e) => SendActiveToToolbox());
-            ws.DocMenu.Items.Add("Đóng", null, (o, e) => CloseDoc(ws.Active));
+            ws.PageMenu = Theme.Menu();
+            Theme.Item(ws.PageMenu, "Xem trước", "\uE890", (o, e) => PreviewSelected());
+            Theme.Item(ws.PageMenu, "Xoay trái", "\uE7A7", (o, e) => ws.RotateSelected(270));
+            Theme.Item(ws.PageMenu, "Xoay phải", "\uE7AD", (o, e) => ws.RotateSelected(90));
+            Theme.Item(ws.PageMenu, "Tách thành tài liệu mới", "\uE8C6", (o, e) => ws.ExtractSelected());
+            ws.PageMenu.Items.Add(new ToolStripSeparator());
+            Theme.Item(ws.PageMenu, "Xóa", "\uE74D", (o, e) => ws.DeleteSelected());
+            ws.DocMenu = Theme.Menu();
+            Theme.Item(ws.DocMenu, "Lưu...", "\uE74E", (o, e) => SaveDoc(ws.Active));
+            Theme.Item(ws.DocMenu, "Đổi tên...", "\uE8AC", (o, e) => RenameActive());
+            Theme.Item(ws.DocMenu, "Chọn tất cả trang", "\uE8B3", (o, e) => ws.SelectAll());
+            Theme.Item(ws.DocMenu, "Mở trong Hộp công cụ...", "\uE90F", (o, e) => SendActiveToToolbox());
+            ws.DocMenu.Items.Add(new ToolStripSeparator());
+            Theme.Item(ws.DocMenu, "Đóng", "\uE711", (o, e) => CloseDoc(ws.Active));
 
-            statusStrip = new StatusStrip();
-            status = new ToolStripStatusLabel { Spring = true, TextAlign = ContentAlignment.MiddleLeft };
-            statusStrip.Items.Add(status);
+            // Thanh trạng thái
+            statusBar = new Panel { Dock = DockStyle.Bottom, Height = S(30) };
+            Theme.Bg(statusBar, Role.Surface);
+            statusBar.Paint += (o, e) => { using (var pen = new Pen(Theme.P.Divider)) e.Graphics.DrawLine(pen, 0, 0, statusBar.Width, 0); };
+            status = new Label { Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(S(12), 0, 0, 0), AutoEllipsis = true, Font = Theme.Ui(9f) };
+            Theme.Fg(status, TextRole.Muted);
+            statusBar.Controls.Add(status);
 
             split.Panel2.Controls.Add(ws);
             split.Panel2.Controls.Add(bar);
             Controls.Add(split);
-            Controls.Add(statusStrip);
+            Controls.Add(statusBar);
 
             Load += (o, e) =>
             {
-                try { split.SplitterDistance = S(int.Parse(Settings.Get("browserwidth", "700"))); } catch { }
+                try
+                {
+                    // Vùng soạn luôn rộng tối thiểu ~560px; khung duyệt file không hẹp quá 320px
+                    split.Panel1MinSize = S(320);
+                    split.Panel2MinSize = S(560);
+                    split.SplitterDistance = Math.Min(S(int.Parse(Settings.Get("browserwidth", "640"))), split.Width - S(560) - split.SplitterWidth);
+                }
+                catch { }
                 browser.Navigate(Settings.Get("browser", Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)), false);
                 UpdateUi();
+                FitToolbar();
             };
         }
 
@@ -2963,6 +3938,19 @@ namespace PdfTool
         }
 
         public void Cleanup() { session.Dispose(); }
+
+        // Thanh công cụ hẹp: ẩn chữ, chỉ còn biểu tượng (vẫn có chú thích khi rê chuột)
+        void FitToolbar()
+        {
+            int need = bar.Padding.Horizontal;
+            foreach (Control c in bar.Controls)
+            {
+                var b = c as FButton;
+                need += (b != null && b.Compactable ? b.FullWidth : c.Width) + c.Margin.Horizontal;
+            }
+            bool compact = need > bar.ClientSize.Width;
+            foreach (var b in bar.Controls.OfType<FButton>()) if (b.Compactable) b.ShowText = !compact;
+        }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
@@ -2980,9 +3968,15 @@ namespace PdfTool
             bCloseAll.Enabled = ws.Docs.Count > 0;
             int pages = ws.Docs.Sum(d => d.Pages.Count);
             status.Text = ws.Docs.Count == 0
-                ? "Kéo file từ danh sách bên trái hoặc từ Explorer vào vùng bên phải. Kéo trang để sắp xếp, giữ Ctrl khi thả để sao chép."
-                : ws.Docs.Count + " tài liệu, " + pages + " trang" + (sel ? ", đang chọn " + ws.Selected.Count + " trang" : "") +
-                  "   |   Kéo trang để sắp xếp hoặc chuyển sang tài liệu khác, giữ Ctrl để sao chép.";
+                ? "Kéo file từ danh sách bên trái hoặc từ File Explorer vào vùng bên phải. Kéo trang để sắp xếp, giữ Ctrl khi thả để sao chép."
+                : ws.Docs.Count + " tài liệu  ·  " + pages + " trang" + (sel ? "  ·  đang chọn " + ws.Selected.Count + " trang" : "") +
+                  "      Kéo trang để sắp xếp hoặc chuyển sang tài liệu khác, giữ Ctrl để sao chép.";
+        }
+
+        void PreviewSelected()
+        {
+            var s = ws.OrderedSelection();
+            if (s.Count > 0) Preview(s[0]);
         }
 
         void OpenDialog()
@@ -3012,7 +4006,7 @@ namespace PdfTool
                 foreach (string f in files)
                 {
                     status.Text = "Đang mở " + Path.GetFileName(f) + "...";
-                    statusStrip.Refresh();
+                    statusBar.Refresh();
                     try
                     {
                         PdfDoc d = session.Import(f, FindForm());
@@ -3118,39 +4112,69 @@ namespace PdfTool
     // ------------------------------------------------------------------
     class MainForm : Form
     {
-        readonly float scale = 1f;
-        int S(int v) { return (int)(v * scale); }
-        readonly TabControl tabs;
+        readonly NavSegment nav;
         readonly CreatorView creator;
         readonly ToolboxView toolbox;
+        readonly FButton themeBtn;
+
+        static int S(int v) { return Theme.S(v); }
 
         public MainForm(string[] args)
         {
-            using (var g = CreateGraphics()) scale = g.DpiX / 96f;
             Text = "PdfTool - Bộ công cụ PDF";
-            Font = new Font("Segoe UI", 9f);
-            Size = new Size(S(1400), S(860));
-            MinimumSize = new Size(S(1000), S(640));
+            Font = Theme.Ui(10f);
+            Size = new Size(S(1400), S(880));
+            MinimumSize = new Size(S(1100), S(680));
             StartPosition = FormStartPosition.CenterScreen;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             if (Settings.Get("maximized", "1") == "1") WindowState = FormWindowState.Maximized;
 
-            tabs = new TabControl { Dock = DockStyle.Fill, Padding = new Point(S(18), S(5)) };
-            creator = new CreatorView(scale) { Dock = DockStyle.Fill };
-            toolbox = new ToolboxView(scale) { Dock = DockStyle.Fill };
-            var t1 = new TabPage("Soạn PDF");
-            t1.Controls.Add(creator);
-            var t2 = new TabPage("Hộp công cụ");
-            t2.Controls.Add(toolbox);
-            tabs.TabPages.Add(t1);
-            tabs.TabPages.Add(t2);
-            Controls.Add(tabs);
-            if (Settings.Get("tab", "0") == "1") tabs.SelectedIndex = 1;
+            var content = new Panel { Dock = DockStyle.Fill };
+            Theme.Bg(content, Role.Window);
+            creator = new CreatorView(Theme.Scale) { Dock = DockStyle.Fill };
+            toolbox = new ToolboxView(Theme.Scale) { Dock = DockStyle.Fill, Visible = false };
+            content.Controls.Add(creator);
+            content.Controls.Add(toolbox);
 
-            creator.SendToToolbox = path => { tabs.SelectedIndex = 1; toolbox.AddPdf(path); };
+            // Đầu trang: logo, tên, chuyển trang, chọn giao diện sáng/tối
+            var header = new TableLayoutPanel { Dock = DockStyle.Top, Height = S(60), ColumnCount = 6, RowCount = 1, Padding = new Padding(S(18), 0, S(14), 0) };
+            Theme.Bg(header, Role.Window);
+            for (int i = 0; i < 4; i++) header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            header.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            var logo = new PictureBox { Size = new Size(S(28), S(28)), SizeMode = PictureBoxSizeMode.Zoom, Anchor = AnchorStyles.Left, Margin = new Padding(0, 0, S(10), 0) };
+            try { logo.Image = new Icon(Icon, 32, 32).ToBitmap(); } catch { }
+            var title = new Label { Text = "PdfTool", AutoSize = true, Font = Theme.UiSemi(13f), Anchor = AnchorStyles.Left, Margin = new Padding(0) };
+            var sub = new Label { Text = "Bộ công cụ PDF", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(S(8), S(3), S(28), 0) };
+            Theme.Fg(sub, TextRole.Muted);
+            nav = new NavSegment { Anchor = AnchorStyles.Left, Margin = new Padding(0) };
+            nav.Add("\uE70F", "Soạn PDF");
+            nav.Add("\uE90F", "Hộp công cụ");
+            nav.SelectedIndexChanged += (s, e) => { creator.Visible = nav.SelectedIndex == 0; toolbox.Visible = nav.SelectedIndex == 1; };
+            themeBtn = new FButton(null, "\uE706", ButtonKind.Subtle) { Anchor = AnchorStyles.Right, Margin = new Padding(0) };
+            themeBtn.Click += (s, e) => ShowThemeMenu();
+            header.Controls.Add(logo, 0, 0);
+            header.Controls.Add(title, 1, 0);
+            header.Controls.Add(sub, 2, 0);
+            header.Controls.Add(nav, 3, 0);
+            header.Controls.Add(themeBtn, 5, 0);
+            var headerLine = new Panel { Dock = DockStyle.Top, Height = 1 };
+            Theme.Bg(headerLine, Role.Divider);
+
+            Controls.Add(content);
+            Controls.Add(headerLine);
+            Controls.Add(header);
+            if (Settings.Get("tab", "0") == "1") nav.SelectedIndex = 1;
+
+            creator.SendToToolbox = path => { nav.SelectedIndex = 1; toolbox.AddPdf(path); };
+            Theme.Changed += OnThemeChanged;
+            UpdateThemeButton();
+            Theme.Apply(this);
+
             Load += (s, e) =>
             {
-                if (args.Length > 0) { tabs.SelectedIndex = 0; creator.OpenFiles(args, null, -1); }
+                if (args.Length > 0) { nav.SelectedIndex = 0; creator.OpenFiles(args, null, -1); }
             };
             FormClosing += (s, e) =>
             {
@@ -3162,13 +4186,41 @@ namespace PdfTool
                 if (creator.HasUnsaved &&
                     MessageBox.Show(this, "Có tài liệu chưa lưu trong thẻ Soạn PDF. Vẫn thoát?", "PdfTool", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
                 { e.Cancel = true; return; }
+                Theme.Changed -= OnThemeChanged;
                 toolbox.SaveSettings();
                 creator.SaveSettings();
-                Settings.Set("tab", tabs.SelectedIndex.ToString());
+                Settings.Set("tab", nav.SelectedIndex.ToString());
                 Settings.Set("maximized", WindowState == FormWindowState.Maximized ? "1" : "0");
                 Settings.Save();
                 creator.Cleanup();
             };
+        }
+
+        void OnThemeChanged()
+        {
+            if (IsDisposed) return;
+            if (InvokeRequired) { BeginInvoke(new Action(OnThemeChanged)); return; }
+            Theme.Apply(this);
+            UpdateThemeButton();
+            Invalidate(true);
+        }
+
+        void UpdateThemeButton()
+        {
+            themeBtn.Glyph = Theme.P.Dark ? "\uE708" : "\uE706";
+            string mode = Theme.Mode == ThemeMode.System ? "theo Windows" : Theme.Mode == ThemeMode.Light ? "sáng" : "tối";
+            Theme.Tip(themeBtn, "Giao diện: " + mode);
+        }
+
+        void ShowThemeMenu()
+        {
+            var m = Theme.Menu();
+            m.ShowCheckMargin = true;
+            Theme.Item(m, "Theo Windows", "\uE713", (s, e) => Theme.SetMode(ThemeMode.System)).Checked = Theme.Mode == ThemeMode.System;
+            Theme.Item(m, "Sáng", "\uE706", (s, e) => Theme.SetMode(ThemeMode.Light)).Checked = Theme.Mode == ThemeMode.Light;
+            Theme.Item(m, "Tối", "\uE708", (s, e) => Theme.SetMode(ThemeMode.Dark)).Checked = Theme.Mode == ThemeMode.Dark;
+            m.Closed += (s, e) => BeginInvoke(new Action(m.Dispose));
+            m.Show(themeBtn, new Point(themeBtn.Width - m.GetPreferredSize(Size.Empty).Width, themeBtn.Height + S(4)));
         }
     }
 
@@ -3185,6 +4237,7 @@ namespace PdfTool
             Application.ThreadException += (s, e) =>
                 MessageBox.Show(e.Exception.Message, "Lỗi", MessageBoxButtons.OK, MessageBoxIcon.Error);
             Settings.Load();
+            Theme.Init();
             Application.Run(new MainForm(args));
         }
     }

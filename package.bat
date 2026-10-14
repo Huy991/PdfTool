@@ -35,6 +35,7 @@ echo    Giu nguyen thu muc "tools" canh PdfTool.exe.
 echo 2. Chay PdfTool.exe. Khong can cai dat.
 echo    Neu Windows hien "Windows protected your PC": bam "More info" roi "Run anyway".
 echo 3. Yeu cau: Windows 10 hoac 11 ^(da co san .NET Framework 4^).
+echo    Chuyen Word/Excel/PowerPoint sang PDF va PDF sang Word can may da cai Microsoft Office.
 echo.
 echo Cac cong cu ma nguon mo di kem ^(thu muc tools^): qpdf ^(Apache 2.0^),
 echo Tesseract OCR ^(Apache 2.0^), Ghostscript ^(AGPL 3.0^). Giay phep xem tools\licenses.
