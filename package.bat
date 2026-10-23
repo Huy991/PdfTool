@@ -24,6 +24,7 @@ robocopy "%SRC%\tesseract" "%T%\tesseract" /e /njh /njs /nfl /ndl >nul
 rem Vietnamese + English OCR data (if downloaded) so the other computer needs no download
 if exist "%APPDATA%\PdfTool\tessdata\vie.traineddata" copy /y "%APPDATA%\PdfTool\tessdata\vie.traineddata" "%T%\tesseract\tessdata\" >nul
 if exist "%APPDATA%\PdfTool\tessdata\eng.traineddata" copy /y "%APPDATA%\PdfTool\tessdata\eng.traineddata" "%T%\tesseract\tessdata\" >nul
+if exist "%APPDATA%\PdfTool\tessdata\osd.traineddata" copy /y "%APPDATA%\PdfTool\tessdata\osd.traineddata" "%T%\tesseract\tessdata\" >nul
 for %%L in (ghostscript qpdf tesseract) do copy /y "%SRC%\licenses\%%L.txt" "%T%\licenses\" >nul
 
 > "%OUT%\HUONG DAN.txt" (

@@ -904,7 +904,7 @@ namespace PdfTool
         }
 
         // Trả về thư mục tessdata có đủ ngôn ngữ; tải dữ liệu còn thiếu từ GitHub (tesseract-ocr/tessdata_fast)
-        static string EnsureTessData(Job job, string[] langs)
+        public static string EnsureTessData(Job job, string[] langs)
         {
             string tess = Ext.Require(Ext.Tesseract, "Tesseract OCR");
             string builtIn = Path.Combine(Path.GetDirectoryName(tess), "tessdata");
@@ -2992,6 +2992,66 @@ namespace PdfTool
             }
         }
 
+        // Nhận biết chiều chữ của các trang bằng Tesseract (chế độ OSD). Kết quả là góc cần xoay thêm so với
+        // file gốc (0/90/180/270). Trang quá ít chữ hoặc nhận biết không chắc chắn thì không có trong kết quả.
+        public Dictionary<PageRef, int> DetectRotation(List<PageRef> pages, string tessData, Action<int, int> progress)
+        {
+            string gs = Ext.Require(Ext.Gs, "Ghostscript"), tess = Ext.Require(Ext.Tesseract, "Tesseract OCR");
+            string tmp = Path.Combine(Dir, "osd_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(tmp);
+            try
+            {
+                // Ảnh xám 150 dpi; mỗi file nguồn chỉ gọi Ghostscript một lần cho các trang cần xét
+                var images = new Dictionary<string, List<PageRef>>();
+                int n = 0;
+                foreach (var grp in pages.GroupBy(p => p.File))
+                {
+                    var idx = grp.Select(p => p.Index).Distinct().OrderBy(i => i).ToList();
+                    string prefix = Path.Combine(tmp, "f" + (n++) + "_");
+                    Ext.Check(gs, "-q -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pnggray -r150 -sPageList=" + string.Join(",", idx) + " " +
+                                  Ext.Q("-sOutputFile=" + prefix + "%d.png") + " " + Ext.Q(grp.Key));
+                    for (int k = 0; k < idx.Count; k++)
+                        images[prefix + (k + 1) + ".png"] = grp.Where(p => p.Index == idx[k]).ToList();
+                }
+
+                var result = new Dictionary<PageRef, int>();
+                int done = 0;
+                var po = new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, Math.Min(4, Environment.ProcessorCount / 2)) };
+                System.Threading.Tasks.Parallel.ForEach(images, po, img =>
+                {
+                    int rot = -1;
+                    if (File.Exists(img.Key))
+                    {
+                        string output;
+                        Ext.Run(tess, Ext.Q(img.Key) + " - --psm 0 --dpi 150 --tessdata-dir " + Ext.Q(tessData), out output);
+                        rot = ParseOsd(output);
+                    }
+                    lock (result)
+                    {
+                        if (rot >= 0) foreach (var p in img.Value) result[p] = rot;
+                        done++;
+                        if (progress != null) progress(done, images.Count);
+                    }
+                });
+                return result;
+            }
+            finally
+            {
+                try { Directory.Delete(tmp, true); } catch { }
+            }
+        }
+
+        // "Rotate: 90" và "Orientation confidence: 12.3" trong kết quả OSD; độ tin cậy dưới 3 thì bỏ qua
+        static int ParseOsd(string output)
+        {
+            var r = Regex.Match(output, @"Rotate:\s*(\d+)");
+            var c = Regex.Match(output, @"Orientation confidence:\s*([\d.]+)");
+            double conf;
+            if (!r.Success || !c.Success || !double.TryParse(c.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out conf) || conf < 3) return -1;
+            int rot = int.Parse(r.Groups[1].Value);
+            return rot == 90 || rot == 180 || rot == 270 ? rot : 0;
+        }
+
         public Bitmap Render(PageRef p, int dpi)
         {
             string png = Path.Combine(Dir, "prev_" + Guid.NewGuid().ToString("N") + ".png");
@@ -3571,6 +3631,24 @@ namespace PdfTool
             }
         }
 
+        // Đặt góc xoay theo kết quả nhận biết chiều chữ; trả về số trang đã đổi
+        public int ApplyRotation(Dictionary<PageRef, int> rotations)
+        {
+            int changed = 0;
+            foreach (var d in Docs)
+                foreach (var pg in d.Pages)
+                {
+                    int r;
+                    if (!rotations.TryGetValue(pg, out r) || pg.Rot == r) continue;
+                    pg.Rot = r;
+                    d.Modified = true;
+                    changed++;
+                }
+            Relayout();
+            OnChanged();
+            return changed;
+        }
+
         public void RotateSelected(int deg)
         {
             var sel = OrderedSelection();
@@ -3814,7 +3892,8 @@ namespace PdfTool
         readonly Panel statusBar;
         readonly Label status;
         readonly List<FButton> needSelection = new List<FButton>(), needDoc = new List<FButton>();
-        FButton bMerge, bCloseAll;
+        FButton bMerge, bCloseAll, bAutoRotate, bAutoRotateAll;
+        bool autoRotating;
         public Action<string> SendToToolbox;
 
         public CreatorView(float scale)
@@ -3876,6 +3955,8 @@ namespace PdfTool
             rotL.MirrorGlyph = true;
             needSelection.Add(rotL);
             needSelection.Add(add(null, "\uE7AD", "Xoay phải 90° các trang đang chọn", () => ws.RotateSelected(90)));
+            bAutoRotate = add("Tự xoay", "\uE895", "Tự động xoay các trang bị ngược hoặc nằm ngang về đúng chiều chữ\n(các trang đang chọn, hoặc cả tài liệu nếu chưa chọn trang)", () => AutoRotate(null));
+            bAutoRotateAll = add("Tự xoay tất cả", "\uE8EE", "Tự động xoay về đúng chiều chữ toàn bộ các trang của mọi tài liệu đang mở", AutoRotateAll);
             needSelection.Add(add("Xóa", "\uE74D", "Xóa các trang đang chọn (Delete)", ws.DeleteSelected));
             needSelection.Add(add("Xem", "\uE890", "Xem trang đang chọn cỡ lớn (Enter hoặc nhấn đúp)", PreviewSelected));
             bar.Controls.Add(new Separator());
@@ -3890,6 +3971,7 @@ namespace PdfTool
             Theme.Item(ws.PageMenu, "Xem trước", "\uE890", (o, e) => PreviewSelected());
             Theme.Item(ws.PageMenu, "Xoay trái", "\uE7A7", (o, e) => ws.RotateSelected(270));
             Theme.Item(ws.PageMenu, "Xoay phải", "\uE7AD", (o, e) => ws.RotateSelected(90));
+            Theme.Item(ws.PageMenu, "Tự xoay theo chiều chữ", "\uE895", (o, e) => AutoRotate(null));
             Theme.Item(ws.PageMenu, "Tách thành tài liệu mới", "\uE8C6", (o, e) => ws.ExtractSelected());
             ws.PageMenu.Items.Add(new ToolStripSeparator());
             Theme.Item(ws.PageMenu, "Xóa", "\uE74D", (o, e) => ws.DeleteSelected());
@@ -3897,6 +3979,8 @@ namespace PdfTool
             Theme.Item(ws.DocMenu, "Lưu...", "\uE74E", (o, e) => SaveDoc(ws.Active));
             Theme.Item(ws.DocMenu, "Đổi tên...", "\uE8AC", (o, e) => RenameActive());
             Theme.Item(ws.DocMenu, "Chọn tất cả trang", "\uE8B3", (o, e) => ws.SelectAll());
+            Theme.Item(ws.DocMenu, "Tự xoay cả tài liệu theo chiều chữ", "\uE895", (o, e) => { if (ws.Active != null) AutoRotate(ws.Active.Pages.ToList()); });
+            Theme.Item(ws.DocMenu, "Tự xoay tất cả tài liệu", "\uE8EE", (o, e) => AutoRotateAll());
             Theme.Item(ws.DocMenu, "Mở trong Hộp công cụ...", "\uE90F", (o, e) => SendActiveToToolbox());
             ws.DocMenu.Items.Add(new ToolStripSeparator());
             Theme.Item(ws.DocMenu, "Đóng", "\uE711", (o, e) => CloseDoc(ws.Active));
@@ -3939,7 +4023,7 @@ namespace PdfTool
 
         public void Cleanup() { session.Dispose(); }
 
-        // Thanh công cụ hẹp: ẩn chữ, chỉ còn biểu tượng (vẫn có chú thích khi rê chuột)
+        // Thanh công cụ hẹp: ẩn chữ dần từ các nút bên phải, chỉ còn biểu tượng (vẫn có chú thích khi rê chuột)
         void FitToolbar()
         {
             int need = bar.Padding.Horizontal;
@@ -3948,8 +4032,15 @@ namespace PdfTool
                 var b = c as FButton;
                 need += (b != null && b.Compactable ? b.FullWidth : c.Width) + c.Margin.Horizontal;
             }
-            bool compact = need > bar.ClientSize.Width;
-            foreach (var b in bar.Controls.OfType<FButton>()) if (b.Compactable) b.ShowText = !compact;
+            var compactable = bar.Controls.OfType<FButton>().Where(b => b.Compactable).ToList();
+            var iconOnly = new HashSet<FButton>();
+            for (int i = compactable.Count - 1; i >= 0 && need > bar.ClientSize.Width; i--)
+            {
+                var b = compactable[i];
+                need -= b.FullWidth - b.Height;
+                iconOnly.Add(b);
+            }
+            foreach (var b in compactable) b.ShowText = !iconOnly.Contains(b);
         }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
@@ -3965,12 +4056,62 @@ namespace PdfTool
             foreach (var b in needSelection) b.Enabled = sel;
             foreach (var b in needDoc) b.Enabled = doc;
             bMerge.Enabled = ws.Docs.Count > 1;
+            bAutoRotate.Enabled = doc && !autoRotating;
+            bAutoRotateAll.Enabled = ws.Docs.Count > 0 && !autoRotating;
             bCloseAll.Enabled = ws.Docs.Count > 0;
             int pages = ws.Docs.Sum(d => d.Pages.Count);
             status.Text = ws.Docs.Count == 0
                 ? "Kéo file từ danh sách bên trái hoặc từ File Explorer vào vùng bên phải. Kéo trang để sắp xếp, giữ Ctrl khi thả để sao chép."
                 : ws.Docs.Count + " tài liệu  ·  " + pages + " trang" + (sel ? "  ·  đang chọn " + ws.Selected.Count + " trang" : "") +
                   "      Kéo trang để sắp xếp hoặc chuyển sang tài liệu khác, giữ Ctrl để sao chép.";
+        }
+
+        // Toàn bộ các trang của mọi tài liệu đang mở
+        void AutoRotateAll()
+        {
+            AutoRotate(ws.Docs.SelectMany(d => d.Pages).ToList());
+        }
+
+        // Nhận biết chiều chữ (chạy nền) rồi xoay các trang bị ngược/nằm ngang về đúng chiều.
+        // pages = null: các trang đang chọn, hoặc cả tài liệu đang chọn nếu chưa chọn trang
+        void AutoRotate(List<PageRef> pages)
+        {
+            if (autoRotating) return;
+            if (pages == null)
+                pages = ws.Selected.Count > 0 ? ws.OrderedSelection() : ws.Active != null ? ws.Active.Pages.ToList() : new List<PageRef>();
+            if (pages.Count == 0) return;
+            autoRotating = true;
+            UpdateUi();
+            Action<string> show = text => BeginInvoke(new Action(() => status.Text = text));
+            show("Đang nhận biết chiều chữ của " + pages.Count + " trang...");
+            var th = new Thread(() =>
+            {
+                Dictionary<PageRef, int> result = null;
+                string error = null;
+                try
+                {
+                    var job = new Job { Log = msg => show(msg.Trim()) };
+                    string tessData = Ops.EnsureTessData(job, new[] { "osd" });
+                    result = session.DetectRotation(pages, tessData, (done, total) => show("Đang nhận biết chiều chữ: " + done + " / " + total + " trang..."));
+                }
+                catch (Exception ex) { error = ex.Message; }
+                BeginInvoke(new Action(() =>
+                {
+                    autoRotating = false;
+                    UpdateUi();
+                    if (error != null)
+                    {
+                        MessageBox.Show(FindForm(), "Không tự xoay được:\r\n" + error, "PdfTool", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        return;
+                    }
+                    int changed = ws.ApplyRotation(result);
+                    int unknown = pages.Count(p => !result.ContainsKey(p));
+                    status.Text = (changed == 0 ? "Các trang đã đúng chiều, không cần xoay." : "Đã xoay " + changed + " trang về đúng chiều chữ.") +
+                                  (unknown > 0 ? "  " + unknown + " trang ít chữ hoặc không chắc chắn nên giữ nguyên." : "");
+                }));
+            });
+            th.IsBackground = true;
+            th.Start();
         }
 
         void PreviewSelected()

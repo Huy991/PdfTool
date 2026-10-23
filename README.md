@@ -1,6 +1,6 @@
 # PdfTool
 
-Bộ công cụ PDF cho Windows, giao diện tiếng Việt
+Bộ công cụ PDF cho Windows, giao diện tiếng Việt.
 
 **Soạn PDF**: duyệt thư mục bên trái, kéo thả file PDF/ảnh sang bên phải để xem trang dạng ảnh thu nhỏ; kéo trang để sắp xếp hoặc chuyển giữa các tài liệu, xoay, xóa, tách, gộp rồi lưu.
 
